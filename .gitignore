@@ -1,0 +1,6 @@
+/*
+!/script/
+!/script/script_query_greenplum.py
+!/script/config/
+!/script/config/**
+!/.gitignore

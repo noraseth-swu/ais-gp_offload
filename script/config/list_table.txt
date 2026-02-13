@@ -1,0 +1,3 @@
+PROD_DB|finance.daily_sales
+PROD_DB|hr.employee_list
+DW_DB|marketing.campaign

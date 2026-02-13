@@ -1,0 +1,1 @@
+SELECT 'DW_DB|marketing|campaign' || '|' || COUNT(*)::text || '|' || 'cost:' || COALESCE(SUM(cost), 0)::text || ',' || 'clicks:' || COALESCE(SUM(clicks), 0)::text FROM marketing.campaign;

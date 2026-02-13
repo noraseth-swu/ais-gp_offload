@@ -1,0 +1,3 @@
+local_temp_dir=./temp_data
+nas_destination=/mnt/nas/output
+log_dir=/home/gpadmin/gpoffload/logs
