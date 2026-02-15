@@ -451,7 +451,7 @@ class MonitorThread(threading.Thread):
         self.num_workers = num_workers
         self.stop_event = threading.Event()
         self.daemon = True
-        self.first_print = True # เพิ่ม Flag เช็คการพรินต์ครั้งแรก
+        self.first_print = True
 
     def stop(self):
         self.stop_event.set()
@@ -467,7 +467,6 @@ class MonitorThread(threading.Thread):
         pct = 100.0 * comp / total if total > 0 else 0
         elapsed = time.time() - self.tracker.start_time
 
-        # 1. เตรียมข้อความ Dashboard ทีละบรรทัด
         lines = []
         lines.append("============================================================")
         lines.append(" GREENPLUM EXPORT MONITOR (Python 2.7 Parallel) ")
@@ -479,22 +478,17 @@ class MonitorThread(threading.Thread):
         workers = sorted(self.tracker.worker_status.keys())
         for w_name in workers:
             status = self.tracker.worker_status.get(w_name, "Initializing...")
-            # ตัดข้อความที่ยาวเกินไป เพื่อไม่ให้ล้นบรรทัด Terminal
             line_str = " {0} : {1}".format(w_name, status)
             lines.append(line_str[:79]) 
         
         lines.append("-" * 60)
         lines.append(" Press Ctrl+C to abort.")
 
-        # 2. หากไม่ใช่การพรินต์ครั้งแรก ให้เลื่อน Cursor กลับขึ้นไปด้านบนเท่ากับจำนวนบรรทัด
         if not self.first_print:
-            # \033[F = เลื่อน Cursor ขึ้น 1 บรรทัด
             sys.stdout.write('\033[F' * len(lines))
         else:
             self.first_print = False
 
-        # 3. พิมพ์ข้อความใหม่ทับของเดิม 
-        # \033[K = ลบข้อความเก่าที่อาจตกค้างอยู่ในบรรทัดนั้นทิ้ง (เคลียร์หางบรรทัด)
         output = "\n".join([line + "\033[K" for line in lines]) + "\n"
         
         sys.stdout.write(output)
