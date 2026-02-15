@@ -541,6 +541,8 @@ class GreenplumExportJob(object):
                     self.logger.error("All workers died unexpectedly! Aborting wait loop.")
                     break
                 time.sleep(1)
+            for w in workers:
+                w.join()
         except KeyboardInterrupt:
             sys.stdout.write("\n\n>>> KEYBOARD INTERRUPT DETECTED! ABORTING SCRIPT... <<<\n\n")
             sys.stdout.flush()
