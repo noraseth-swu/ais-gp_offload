@@ -111,7 +111,9 @@ class ProcessTracker(object):
         print("Log File: {0}".format(log_path))
         print("="*80)
 
-def setup_logging(log_dir, log_name="app"):
+def setup_logging(log_dir, log_name="app", date_folder = None, timestamp=None):
+    log_dir = os.path.join(log_dir, date_folder)
+
     if not os.path.exists(log_dir):
         try:
             os.makedirs(log_dir)
@@ -119,7 +121,6 @@ def setup_logging(log_dir, log_name="app"):
             print("WARNING: Could not create log directory '{0}'. Using current directory. Error: {1}".format(log_dir, e))
             log_dir = '.'
 
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_file = os.path.join(log_dir, "{0}_{1}.log".format(log_name, timestamp))
 
     logger = logging.getLogger("GreenplumBatch")
@@ -155,7 +156,7 @@ def peek_env_config(env_path, key_to_find):
 # ==============================================================================
 
 class Config(object):
-    def __init__(self, env_config_path, master_config_path, list_file_path, cli_tables, logger):
+    def __init__(self, env_config_path, master_config_path, list_file_path, cli_tables, logger, date_folder = None):
         self.logger = logger
         
         # 1. Load Environment Config
@@ -183,8 +184,13 @@ class Config(object):
                             self.log_dir = value
                 
             # Create temp dir if not exists
-            if not os.path.exists(self.local_temp_dir):
-                os.makedirs(self.local_temp_dir)
+            if self.local_temp_dir:
+                self.local_temp_dir = os.path.join(self.local_temp_dir, date_folder)
+                if not os.path.exists(self.local_temp_dir):
+                    os.makedirs(self.local_temp_dir)
+
+            if self.nas_dest_base:
+                self.nas_dest_base = os.path.join(self.nas_dest_base, date_folder)        
         except Exception as e:
             self.logger.error("Failed to load environment config: {0}".format(e))
             raise
@@ -256,9 +262,10 @@ class Config(object):
 # ==============================================================================
 
 class QueryBuilder(object):
-    def __init__(self, temp_dir, logger):
+    def __init__(self, temp_dir, logger, global_ts):
         self.temp_dir = temp_dir
         self.logger = logger
+        self.global_ts = global_ts
 
     def build_and_save_query(self, db, schema, table, partition, cols_str, where):
         """
@@ -301,8 +308,7 @@ class QueryBuilder(object):
 
             # Save SQL to temp file for history
             unique_id = str(uuid.uuid4())[:8]
-            ts = datetime.now().strftime("%Y%m%d%H%M%S")
-            filename = "query_{0}_{1}_{2}_{3}.sql".format(db, table, ts, unique_id)
+            filename = "query_{0}_{1}_{2}_{3}.sql".format(db, table, self.global_ts, unique_id)
             filepath = os.path.join(self.temp_dir, filename)
 
             with open(filepath, 'w') as f:
@@ -351,7 +357,7 @@ class FileHandler(object):
 # ==============================================================================
 
 class Worker(threading.Thread):
-    def __init__(self, thread_id, job_queue, config, builder, shell, file_h, tracker, logger):
+    def __init__(self, thread_id, job_queue, config, builder, shell, file_h, tracker, logger, global_ts):
         threading.Thread.__init__(self)
         self.thread_id = thread_id
         self.name = "Worker-{0:02d}".format(thread_id)
@@ -362,6 +368,7 @@ class Worker(threading.Thread):
         self.file_h = file_h
         self.tracker = tracker
         self.logger = logger
+        self.global_ts = global_ts
         self.daemon = True
 
     def run(self):
@@ -404,10 +411,9 @@ class Worker(threading.Thread):
                             master_info['where']
                         )
 
-                        # 3. PSQL
-                        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                        # 3. PSQL                        
                         unique_id = str(uuid.uuid4())[:8]
-                        output_filename = "{0}_{1}_{2}_{3}.txt".format(db, table, ts, unique_id)
+                        output_filename = "{0}_{1}_{2}_{3}.txt".format(db, table, self.global_ts, unique_id)
                         local_path = os.path.join(self.config.local_temp_dir, output_filename)
 
                         self.shell.run_psql(sql, local_path, db)
@@ -445,6 +451,7 @@ class MonitorThread(threading.Thread):
         self.num_workers = num_workers
         self.stop_event = threading.Event()
         self.daemon = True
+        self.first_print = True # เพิ่ม Flag เช็คการพรินต์ครั้งแรก
 
     def stop(self):
         self.stop_event.set()
@@ -456,41 +463,57 @@ class MonitorThread(threading.Thread):
         self.print_dashboard()
 
     def print_dashboard(self):
-        os.system('cls' if os.name == 'nt' else 'clear')
-
         comp, total = self.tracker.get_progress()
         pct = 100.0 * comp / total if total > 0 else 0
         elapsed = time.time() - self.tracker.start_time
 
-        print("="*60)
-        print(" GREENPLUM EXPORT MONITOR (Python 2.7 Parallel) ")
-        print("="*60)
-        print(" Progress: {0}/{1} ({2:.2f}%)".format(comp, total, pct))
-        print(" Elapsed : {0:.0f}s".format(elapsed))
-        print("-" * 60)
+        # 1. เตรียมข้อความ Dashboard ทีละบรรทัด
+        lines = []
+        lines.append("============================================================")
+        lines.append(" GREENPLUM EXPORT MONITOR (Python 2.7 Parallel) ")
+        lines.append("============================================================")
+        lines.append(" Progress: {0}/{1} ({2:.2f}%)".format(comp, total, pct))
+        lines.append(" Elapsed : {0:.0f}s".format(elapsed))
+        lines.append("-" * 60)
 
-        # Print Status of each worker
-        worker = sorted(self.tracker.worker_status.keys())
-        for w_name in worker:
+        workers = sorted(self.tracker.worker_status.keys())
+        for w_name in workers:
             status = self.tracker.worker_status.get(w_name, "Initializing...")
-            print(" {0} : {1}".format(w_name, status))
+            # ตัดข้อความที่ยาวเกินไป เพื่อไม่ให้ล้นบรรทัด Terminal
+            line_str = " {0} : {1}".format(w_name, status)
+            lines.append(line_str[:79]) 
         
-        print("-" * 60)
-        print(" Press Ctl+C to abort.")
+        lines.append("-" * 60)
+        lines.append(" Press Ctrl+C to abort.")
+
+        # 2. หากไม่ใช่การพรินต์ครั้งแรก ให้เลื่อน Cursor กลับขึ้นไปด้านบนเท่ากับจำนวนบรรทัด
+        if not self.first_print:
+            # \033[F = เลื่อน Cursor ขึ้น 1 บรรทัด
+            sys.stdout.write('\033[F' * len(lines))
+        else:
+            self.first_print = False
+
+        # 3. พิมพ์ข้อความใหม่ทับของเดิม 
+        # \033[K = ลบข้อความเก่าที่อาจตกค้างอยู่ในบรรทัดนั้นทิ้ง (เคลียร์หางบรรทัด)
+        output = "\n".join([line + "\033[K" for line in lines]) + "\n"
+        
+        sys.stdout.write(output)
+        sys.stdout.flush()
 
 # ==============================================================================
 # 4. Main Job Class
 # ==============================================================================
 class GreenplumExportJob(object):
-    def __init__(self, args, logger, log_path):
+    def __init__(self, args, logger, log_path, global_date_folder, global_ts):
         self.args = args
         self.logger = logger
         self.log_path = log_path
+        self.global_ts = global_ts
         self.tracker = ProcessTracker(logger)
 
         # Init Helpers
-        self.config = Config(args.env, args.master, args.list, args.table_name, logger)
-        self.builder = QueryBuilder(self.config.local_temp_dir, logger)
+        self.config = Config(args.env, args.master, args.list, args.table_name, logger, global_date_folder)
+        self.builder = QueryBuilder(self.config.local_temp_dir, logger, self.global_ts)
         self.shell = ShellHandler(logger)
         self.file_h = FileHandler(logger)
 
@@ -509,7 +532,7 @@ class GreenplumExportJob(object):
         workers = []
         # Create & Start Workers
         for i in range(num_workers):
-            w = Worker(i+1, self.job_queue, self.config, self.builder, self.shell, self.file_h, self.tracker, self.logger)
+            w = Worker(i+1, self.job_queue, self.config, self.builder, self.shell, self.file_h, self.tracker, self.logger, self.global_ts)
             workers.append(w)
             w.start()
 
@@ -519,12 +542,15 @@ class GreenplumExportJob(object):
 
         # Wait for Queue to be empty
         try:
-            while any(w.is_alive() for w in workers):
-                time.sleep(0.5)
-                if self.job_queue.empty() and all(not w.is_alive() for w in workers):
+            while self.tracker.completed_task < self.tracker.total_task:
+                if not any(w.is_alive() for w in workers):
+                    self.logger.error("All workers died unexpectedly! Aborting wait loop.")
                     break
+                time.sleep(1)
         except KeyboardInterrupt:
-            self.logger.warning("Keyboard Interrupt! Stopping...")
+            sys.stdout.write("\n\n>>> KEYBOARD INTERRUPT DETECTED! ABORTING SCRIPT... <<<\n\n")
+            sys.stdout.flush()
+            self.logger.warning("Keyboard Interrupt! User aborted the script.")
         finally:
             monitor.stop()
             monitor.join()
@@ -540,16 +566,20 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
+    run_datetime = datetime.now()
+    global_date_folder = run_datetime.strftime("%Y%m%d")
+    global_ts = run_datetime.strftime("%Y%m%d_%H%M%S")
+
     current_script_dir = os.path.dirname(os.path.abspath(__file__))
     default_log_dir = os.path.join(current_script_dir, 'logs')
     configured_log_dir = peek_env_config(args.env, 'log_dir')
     final_log_dir = configured_log_dir if configured_log_dir else default_log_dir
 
-    logger, log_path = setup_logging(final_log_dir, 'gp_export')
+    logger, log_path = setup_logging(final_log_dir, 'gp_export', global_date_folder, global_ts)
     logger.info("Started with concurrency: {0}".format(args.concurrency))
 
     try:
-        job = GreenplumExportJob(args, logger, log_path)
+        job = GreenplumExportJob(args, logger, log_path, global_date_folder, global_ts)
         job.run()
     except Exception as e:
         logger.critical("Job aborted due to critical error: {0}".format(e))
