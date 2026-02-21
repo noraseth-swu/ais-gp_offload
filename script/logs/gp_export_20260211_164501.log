@@ -1,7 +1,0 @@
-2026-02-11 16:45:01,877 [INFO] Arguments: Namespace(env='config.txt', master='config_master.txt', list='list_table.txt', table_name=None)
-2026-02-11 16:45:01,877 [INFO] >>> Start Step: Initialization
-2026-02-11 16:45:01,878 [INFO] Loading environment config: config.txt
-2026-02-11 16:45:01,879 [ERROR] Failed to load environment config: [Errno 2] No such file or directory: 'config.txt'
-2026-02-11 16:45:01,879 [CRITICAL] Initialization Failed: [Errno 2] No such file or directory: 'config.txt'
-2026-02-11 16:45:01,879 [INFO] <<< End Step: Initialization (Duration: 0.00s)
-2026-02-11 16:45:01,880 [CRITICAL] Job aborted due to critical error: [Errno 2] No such file or directory: 'config.txt'

@@ -1,2 +1,0 @@
-local_temp_dir=D:\git\ais-gp\script\test_debug_output
-nas_destination=D:\git\ais-gp\script\test_debug_output\nas

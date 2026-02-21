@@ -1,1 +1,0 @@
-SELECT 'PROD_DB|hr|employee_list' || '|' || COUNT(*)::text || '|' || 'salary:' || COALESCE(SUM(salary), 0)::text FROM hr.employee_list WHERE status = 'ACTIVE';

@@ -1,1 +1,0 @@
-SELECT 'PROD_DB|finance|daily_sales_p202310' || '|' || COUNT(*)::text || '|' || 'amt:' || COALESCE(SUM(amt), 0)::text || ',' || 'tax:' || COALESCE(SUM(tax), 0)::text FROM finance.daily_sales WHERE sale_date = '2023-10-01';
