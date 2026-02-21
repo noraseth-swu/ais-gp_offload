@@ -156,14 +156,14 @@ def peek_env_config(env_path, key_to_find):
 # ==============================================================================
 
 class Config(object):
-    def __init__(self, env_config_path, master_config_path, list_file_path, cli_tables, logger, date_folder = None):
+    def __init__(self, env_config_path, master_config_path, list_file_path, cli_tables, logger, date_folder = None, main_path=None):
         self.logger = logger
         
         # 1. Load Environment Config
         self.logger.info("Loading environment config: {0}".format(env_config_path))
-        self.local_temp_dir = './temp'
-        self.nas_dest_base = None
-        self.log_dir = None
+        self.local_temp_dir = os.path.join(main_path, 'temp')
+        self.nas_dest_base = os.path.join(main_path, 'output')
+        self.log_dir = os.path.join(main_path, 'log')
         
         try:
             with open(env_config_path, 'r') as f:
@@ -307,8 +307,8 @@ class QueryBuilder(object):
             sql += ";"
 
             # Save SQL to temp file for history
-            unique_id = str(uuid.uuid4())[:8]
-            filename = "query_{0}_{1}_{2}_{3}.sql".format(db, table, self.global_ts, unique_id)
+            #unique_id = str(uuid.uuid4())[:8]
+            filename = "query_{0}_{1}_{2}.sql".format(db, table, self.global_ts)
             filepath = os.path.join(self.temp_dir, filename)
 
             with open(filepath, 'w') as f:
@@ -412,8 +412,8 @@ class Worker(threading.Thread):
                         )
 
                         # 3. PSQL                        
-                        unique_id = str(uuid.uuid4())[:8]
-                        output_filename = "{0}_{1}_{2}_{3}.txt".format(db, table, self.global_ts, unique_id)
+                        #unique_id = str(uuid.uuid4())[:8]
+                        output_filename = "{0}_{1}_{2}.txt".format(db, table, self.global_ts)
                         local_path = os.path.join(self.config.local_temp_dir, output_filename)
 
                         self.shell.run_psql(sql, local_path, db)
@@ -445,10 +445,11 @@ class Worker(threading.Thread):
                 self.queue.task_done()
 
 class MonitorThread(threading.Thread):
-    def __init__(self, tracker, num_workers):
+    def __init__(self, tracker, num_workers, log_path):
         threading.Thread.__init__(self)
         self.tracker = tracker
         self.num_workers = num_workers
+        self.log_path = log_path
         self.stop_event = threading.Event()
         self.daemon = True
         self.first_print = True
@@ -482,6 +483,7 @@ class MonitorThread(threading.Thread):
             lines.append(line_str[:79]) 
         
         lines.append("-" * 60)
+        lines.append(" Log File: {0}".format(self.log_path))
         lines.append(" Press Ctrl+C to abort.")
 
         if not self.first_print:
@@ -498,7 +500,7 @@ class MonitorThread(threading.Thread):
 # 4. Main Job Class
 # ==============================================================================
 class GreenplumExportJob(object):
-    def __init__(self, args, logger, log_path, global_date_folder, global_ts):
+    def __init__(self, args, logger, log_path, global_date_folder, global_ts, main_path):
         self.args = args
         self.logger = logger
         self.log_path = log_path
@@ -506,7 +508,7 @@ class GreenplumExportJob(object):
         self.tracker = ProcessTracker(logger)
 
         # Init Helpers
-        self.config = Config(args.env, args.master, args.list, args.table_name, logger, global_date_folder)
+        self.config = Config(args.env, args.master, args.list, args.table_name, logger, global_date_folder, main_path)
         self.builder = QueryBuilder(self.config.local_temp_dir, logger, self.global_ts)
         self.shell = ShellHandler(logger)
         self.file_h = FileHandler(logger)
@@ -531,7 +533,7 @@ class GreenplumExportJob(object):
             w.start()
 
         # Start Monitor
-        monitor = MonitorThread(self.tracker, num_workers)
+        monitor = MonitorThread(self.tracker, num_workers, self.log_path)
         monitor.start()
 
         # Wait for Queue to be empty
@@ -553,29 +555,34 @@ class GreenplumExportJob(object):
             self.tracker.print_summary(self.log_path)
 
 if __name__ == "__main__":
+    current_script_dir = os.path.dirname(os.path.abspath(__file__))
+    main_path = os.path.dirname(current_script_dir)
+
     parser = argparse.ArgumentParser(description='Greenplum Data Export Tool')
-    parser.add_argument('--env', default='config.txt', help='Path to environment config text file')
-    parser.add_argument('--master', default='config_master.txt', help='Path to master config pipe-delimited')
-    parser.add_argument('--list', default='list_table.txt', help='Path to list of tables to run')
-    parser.add_argument('--table_name', help='Optional: Specific tables to run (DB|Schema.Table) comma separated')
+    parser.add_argument('--env', default='env_config.txt', help='Name of env config file')
+    parser.add_argument('--master', default='config_master.txt', help='Name of master config file')
+    parser.add_argument('--list', default='list_table.txt', help='Name of list of tables file')
+    parser.add_argument('--table_name', help='Optional: Specific tables to run (DB|Schema.Table)')
     parser.add_argument('--concurrency', default=4, type=int, help='Number of parallel workers (Default: 4)')
 
     args = parser.parse_args()
+
+    args.env = os.path.join(main_path, 'config', os.path.basename(args.env))
+    args.master = os.path.join(main_path, 'config', os.path.basename(args.master))
+    args.list = os.path.join(main_path, 'config', os.path.basename(args.list))
 
     run_datetime = datetime.now()
     global_date_folder = run_datetime.strftime("%Y%m%d")
     global_ts = run_datetime.strftime("%Y%m%d_%H%M%S")
 
-    current_script_dir = os.path.dirname(os.path.abspath(__file__))
-    default_log_dir = os.path.join(current_script_dir, 'logs')
     configured_log_dir = peek_env_config(args.env, 'log_dir')
-    final_log_dir = configured_log_dir if configured_log_dir else default_log_dir
+    final_log_dir = configured_log_dir if configured_log_dir else os.path.join(main_path, 'log')
 
     logger, log_path = setup_logging(final_log_dir, 'gp_export', global_date_folder, global_ts)
     logger.info("Started with concurrency: {0}".format(args.concurrency))
 
     try:
-        job = GreenplumExportJob(args, logger, log_path, global_date_folder, global_ts)
+        job = GreenplumExportJob(args, logger, log_path, global_date_folder, global_ts, main_path)
         job.run()
     except Exception as e:
         logger.critical("Job aborted due to critical error: {0}".format(e))
