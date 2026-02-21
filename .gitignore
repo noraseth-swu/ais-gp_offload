@@ -5,11 +5,11 @@
 !/.gitignore
 
 # 3. *** จุดสำคัญ *** ยกเว้นโฟลเดอร์ script/ เพื่อเปิดประตูให้ Git เข้าไปมองหาไฟล์ข้างในได้
-!/script/
+!/script_query_greenplum/
 
 # 4. พอเข้ามาใน script/ ได้แล้ว ให้สั่ง Ignore ไฟล์ทั้งหมดที่อยู่ในนี้อีกรอบนึงก่อน
-/script/*
+/script_query_greenplum/*
 
 # 5. ยกเว้นเฉพาะไฟล์และโฟลเดอร์ที่คุณต้องการจริงๆ
-!/script/script_query_greenplum.py
-!/script/config/
+!/script_query_greenplum/script_query_greenplum.py
+!/script_query_greenplum/config/
