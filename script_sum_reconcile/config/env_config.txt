@@ -1,7 +1,7 @@
 succeed_path=/home/MNT_NFS/GP_DWS/mig_stat_log/
 hdfs_path=/data/gpoffload/data_recon
 greenplum_result_path=/home/MNT_NFS/GP_DWS/mig_script_greenplum_output/
-
+datatype_mapping_path=/MNT/GP_DWS/mig_table_data_type/
 # Configuration for Parquet Source File Path Replacement (Mount Mapping)
 replace_path_from=/MNT/GP_DWS/
 replace_path_to=/home/MNT_NFS/GP_DWS/
