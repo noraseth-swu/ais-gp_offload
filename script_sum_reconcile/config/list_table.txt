@@ -1,0 +1,4 @@
+#prodgp|prod_db_summary.call_relation_ir_sum_daily_1_prt_p20250929
+#prodgp|prod_db_summary.call_relation_ir_sum_daily_1_prt_p20251003
+#prodgp|prod_mis_vas.vas_voice_summary_monthly_phase_2
+prodgp|prod_db_cdr_3gp.lte_voice_call_1_prt_p202511

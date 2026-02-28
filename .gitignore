@@ -6,10 +6,14 @@
 
 # 3. *** จุดสำคัญ *** ยกเว้นโฟลเดอร์ script/ เพื่อเปิดประตูให้ Git เข้าไปมองหาไฟล์ข้างในได้
 !/script_query_greenplum/
+!/script_sum_reconcile/
 
 # 4. พอเข้ามาใน script/ ได้แล้ว ให้สั่ง Ignore ไฟล์ทั้งหมดที่อยู่ในนี้อีกรอบนึงก่อน
 /script_query_greenplum/*
+/script_sum_reconcile/*
 
 # 5. ยกเว้นเฉพาะไฟล์และโฟลเดอร์ที่คุณต้องการจริงๆ
 !/script_query_greenplum/script_query_greenplum.py
 !/script_query_greenplum/config/
+!/script_sum_reconcile/script_sum_reconcile.py
+!/script_sum_reconcile/config/
