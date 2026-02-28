@@ -56,6 +56,7 @@ class ProcessTracker(object):
         self.logger.info("="*80)
 
         success_count = 0
+        warning_count = 0
         failed_count = 0
         skipped_count = 0
 
@@ -74,6 +75,7 @@ class ProcessTracker(object):
                 if len(r['status']) > max_w_status: max_w_status = len(r['status'])
 
                 if r['status'] == 'SUCCESS': success_count += 1
+                elif r['status'] == 'WARNING': warning_count += 1
                 elif r['status'] == 'FAILED': failed_count += 1
                 elif r['status'] == 'SKIPPED': skipped_count +=1
                        
@@ -95,8 +97,8 @@ class ProcessTracker(object):
                 self.logger.info(row_fmt.format(r['table'], r['status'], r['message'], wt=w_table, ws=w_status))
             
             self.logger.info(sep_line)
-            self.logger.info("Total: {0} | Success: {1} | Failed: {2} | Skipped: {3}".format(
-                len(self.results), success_count, failed_count, skipped_count
+            self.logger.info("Total: {0} | Success: {1} | Warning: {2} | Failed: {3} | Skipped: {4}".format(
+                len(self.results), success_count, warning_count, failed_count, skipped_count
             ))
             self.logger.info("Total Execution Time: {0:.2f}s".format(time.time() - self.start_time))
 
@@ -106,13 +108,15 @@ class ProcessTracker(object):
         print("="*80)
         print("Total: {0}".format(len(self.results)))
         print("Success: {0}".format(success_count))
+        print("Warning: {0}".format(warning_count))
         print("Failed:  {0}".format(failed_count))
         print("Skipped: {0}".format(skipped_count))
         print("Log File: {0}".format(log_path))
         print("="*80)
 
-def setup_logging(log_dir, log_name="app", date_folder = None, timestamp=None):
-    log_dir = os.path.join(log_dir, date_folder)
+def setup_logging(log_dir, log_name="app", date_folder=None, timestamp=None):
+    if date_folder:
+        log_dir = os.path.join(log_dir, date_folder)
 
     if not os.path.exists(log_dir):
         try:
@@ -164,6 +168,7 @@ class Config(object):
         self.local_temp_dir = os.path.join(main_path, 'temp')
         self.nas_dest_base = os.path.join(main_path, 'output')
         self.log_dir = os.path.join(main_path, 'log')
+        self.data_type_file_path = None
         
         try:
             with open(env_config_path, 'r') as f:
@@ -182,6 +187,8 @@ class Config(object):
                             self.nas_dest_base = value
                         elif key == 'log_dir':
                             self.log_dir = value
+                        elif key == 'data_type_file_path':
+                            self.data_type_file_path = value
                 
             # Create temp dir if not exists
             if self.local_temp_dir:
@@ -190,7 +197,13 @@ class Config(object):
                     os.makedirs(self.local_temp_dir)
 
             if self.nas_dest_base:
-                self.nas_dest_base = os.path.join(self.nas_dest_base, date_folder)        
+                self.nas_dest_base = os.path.join(self.nas_dest_base, date_folder)
+            
+            self.logger.info("Resolved local_temp_dir: {0}".format(self.local_temp_dir))
+            self.logger.info("Resolved nas_dest_base: {0}".format(self.nas_dest_base))
+            self.logger.info("Resolved log_dir: {0}".format(self.log_dir))
+            self.logger.info("Resolved data_type_file_path: {0}".format(self.data_type_file_path))
+
         except Exception as e:
             self.logger.error("Failed to load environment config: {0}".format(e))
             raise
@@ -203,15 +216,15 @@ class Config(object):
             with open(master_config_path, 'r') as f:
                 reader = csv.reader(f, delimiter='|')
                 for line in reader:
-                    # Format: db|schema|table|partition|cols|where|...
-                    if len(line) < 6: continue
-                    db, sch, tbl, part, cols, where = [x.strip() for x in line]
+                    # Format: DB | SCHEMA | table | sum_cols | where
+                    if len(line) < 5: continue
+                    db, sch, tbl, sum_cols, where = [x.strip() for x in line[:5]]
                     key = (db, sch, tbl)
                     self.master_data[key] = {
-                        'partition': part, 
-                        'cols': cols,
+                        'sum_cols': sum_cols, 
                         'where': where
                     }
+            self.logger.info("Loaded {0} tables from master config.".format(len(self.master_data)))
         except Exception as e:
             self.logger.error("Failed to load master config: {0}".format(e))
             raise
@@ -267,47 +280,55 @@ class QueryBuilder(object):
         self.logger = logger
         self.global_ts = global_ts
 
-    def build_and_save_query(self, db, schema, table, partition, cols_str, where):
-        """
-        Constructs SQL to match output requirement:
-        db|schema|table_<part>|<count>|col1:sum(col1),...
-        """
-        try:
+    def _parse_aggregate_cols(self, cols_data, agg_func):
+        parts = []
+        if not cols_data:
+            return parts
+        
+        if isinstance(cols_data, str):
+            if cols_data.strip().lower() == 'none' or not cols_data.strip():
+                return parts
+            cols = [c.strip() for c in cols_data.split(',') if c.strip()]
+        elif isinstance(cols_data, list):
+            cols = cols_data
+        else:
             cols = []
 
-            if cols_str and cols_str.strip():
-                cols = [c.strip() for c in cols_str.split(',') if c.strip()]
-            
-            # Logic for Table Name in Output (Partition vs Non-Partition)
-            if partition and partition.lower() != 'none' and partition != '':
-                tbl_display_logic = "'{0}|{1}|{2}_{3}'".format(db, schema, table, partition)
-            else:
-                tbl_display_logic = "'{0}|{1}|{2}'".format(db, schema, table)
-            if cols:
-                # Build Sum Columns Logic: 'colname:' || sum(col)
-                sum_parts = []
-                for col in cols:
-                    part = "'{0}:' || COALESCE(SUM({0}), 0)::text".format(col)
-                    sum_parts.append(part)
-                sum_logic = " || ',' || ".join(sum_parts)
+        for col in cols:
+            if agg_func == 'SUM':
+                parts.append("'{1}({0}):' || COALESCE(SUM({0}), 0)::text".format(col, agg_func))
+            elif agg_func in ['MIN', 'MAX']:
+                parts.append("'{1}({0}):' || COALESCE({1}({0})::text, '')".format(col, agg_func))
+        return parts
 
-                # Final SQL
+    def build_and_save_query(self, db, schema, table, sum_cols_str, min_cols_list, max_cols_list, where, missing_flag):
+        try:
+            # DB|SCHEMA|TABLE
+            tbl_display_logic = "'{0}|{1}|{2}'".format(db, schema, table)
+
+            metric_parts = []
+            metric_parts.extend(self._parse_aggregate_cols(sum_cols_str, 'SUM'))
+            metric_parts.extend(self._parse_aggregate_cols(min_cols_list, 'MIN'))
+            metric_parts.extend(self._parse_aggregate_cols(max_cols_list, 'MAX'))
+            
+            if missing_flag:
+                metric_parts.append("'MIN_MAX_STATUS: DATA_TYPE_FILE_MISSING'")
+
+            if metric_parts:
+                metrics_logic = " || ',' || ".join(metric_parts)
                 sql = "SELECT {0} || '|' || COUNT(*)::text || '|' || {1} FROM {2}.{3}".format(
-                    tbl_display_logic, sum_logic, schema, table
+                    tbl_display_logic, metrics_logic, schema, table
                 )
             else:
-                # Case B: No columns -> Count Only
                 sql = "SELECT {0} || '|' || COUNT(*)::text || '|' FROM {1}.{2}".format(
                     tbl_display_logic, schema, table
                 )
 
-            if where and where.strip():
+            if where and where.strip() and where.strip().lower() != 'none':
                 sql += " WHERE {0}".format(where)
 
             sql += ";"
 
-            # Save SQL to temp file for history
-            #unique_id = str(uuid.uuid4())[:8]
             filename = "query_{0}_{1}_{2}.sql".format(db, table, self.global_ts)
             filepath = os.path.join(self.temp_dir, filename)
 
@@ -330,14 +351,14 @@ class ShellHandler(object):
 
         if db_name: cmd.extend(['-d', db_name])
 
-        self.logger.info("Executing PSQL... (DB: {0})".format(db_name or 'Default'))
+        self.logger.info("Executing PSQL... (DB: {0}) -> Output: {1}".format(db_name or 'Default', output_path))
         try:
             process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             stdout, stderr = process.communicate()
             if process.returncode != 0:
                 raise RuntimeError("PSQL execution failed. RC: {0}. Error: {1}".format(process.returncode, stderr))
             if not (os.path.exists(output_path) and os.path.getsize(output_path) > 0):
-                pass 
+                self.logger.warning("PSQL Executed but output file is missing or 0 bytes: {0}".format(output_path))
         except Exception as e:
             raise
 
@@ -350,6 +371,7 @@ class FileHandler(object):
                 os.makedirs(dest_dir)
             except OSError:
                 pass
+        self.logger.info("Copying file from {0} to NAS: {1}".format(src, dest_dir))
         shutil.copy2(src, dest_dir)
 
 # ==============================================================================
@@ -370,6 +392,32 @@ class Worker(threading.Thread):
         self.logger = logger
         self.global_ts = global_ts
         self.daemon = True
+
+    def _is_min_max_candidate(self, gp_dt, ext_dt):
+        gp_base = str(gp_dt).split('(')[0].strip().lower()
+        ext_base = str(ext_dt).split('(')[0].strip().lower()
+
+        exclude_keywords = [
+            'json', 'xml', 
+            'geometry', 'geography', 'box', 'point', 'line', 'lseg', 'path', 'polygon', 'circle'
+        ]
+
+        if any(keyword in gp_base for keyword in exclude_keywords):
+            return False
+        
+        valid_gp_types = [
+            'character varying', 'varchar', 'char', 'text', 'string', 
+            'date', 'time', 'timestamp', 
+            'int', 'integer', 'bigint', 'smallint', 
+            'numeric', 'decimal', 'float', 'real', 'double precision'
+        ]
+
+        valid_ext_types = ['text', 'character varying', 'varchar', 'string', 'char']
+
+        is_gp_ok = any(t in gp_base for t in valid_gp_types)
+        is_ext_ok = any(t in ext_base for t in valid_ext_types)
+
+        return is_gp_ok and is_ext_ok
 
     def run(self):
         while True:
@@ -394,25 +442,64 @@ class Worker(threading.Thread):
                         self.tracker.update_worker_status(self.name, "[BUSY] {0} (Try {1}/{2})".format(short_name, attempt+1, max_retries))
                         start_t = time.time()
 
+                        self.logger.info("Worker {0} started processing table: {1} (Attempt {2})".format(self.name, full_name, attempt+1))
+
                         # 1. Config Lookup
                         key = (db, schema, table)
                         master_info = self.config.master_data.get(key)
 
                         if not master_info:
                             self.tracker.add_result(full_name, "SKIPPED", "No Config")
-                            self.logger.warning("Skipping {0}: No Config".format(full_name))
+                            self.logger.warning("Worker {0} Skipping {1}: No Config found in master_data".format(self.name, full_name))
                             break
+
+                        min_cols = []
+                        max_cols = []
+                        missing_flag = False
+
+                        csv_path = None
+                        if self.config.data_type_file_path:
+                            csv_path = os.path.join(self.config.data_type_file_path, db, schema, "{0}.csv".format(table))
+                        
+                        if csv_path:
+                            self.logger.info("Worker {0} looking for data type mapping file at: {1}".format(self.name, csv_path))
+                            if os.path.exists(csv_path):
+                                self.logger.info("Worker {0} found data type mapping file: {1}".format(self.name, csv_path))
+                                try:
+                                    with open(csv_path, 'r') as cf:
+                                        reader = csv.DictReader(cf, delimiter='|')
+                                        for row in reader:
+                                            gp_col = row.get('gp_column_nm')
+                                            gp_dt = row.get('gp_datatype', '')
+                                            ext_dt = row.get('ext_datatype', '')
+                                            
+                                            if gp_col and self._is_min_max_candidate(gp_dt, ext_dt):
+                                                min_cols.append(gp_col.strip())
+                                                max_cols.append(gp_col.strip())
+                                    self.logger.info("Worker {0} identified {1} MIN/MAX columns for {2}".format(self.name, len(min_cols), full_name))
+                                except Exception as e:
+                                    self.logger.warning("Worker {0} error reading data type file {1}: {2}".format(self.name, csv_path, e))
+                                    missing_flag = True
+                            else:
+                                self.logger.warning("Worker {0} Data type mapping file NOT FOUND: {1}".format(self.name, csv_path))
+                                missing_flag = True
+                        else:
+                            self.logger.warning("Worker {0} data_type_file_path is None. Skipping MIN/MAX search for {1}".format(self.name, full_name))
+                            missing_flag = True
 
                         # 2. Build SQL
                         sql = self.builder.build_and_save_query(
-                            db, schema, table,
-                            master_info['partition'],
-                            master_info['cols'],
-                            master_info['where']
+                            db, 
+                            schema, 
+                            table, 
+                            master_info['sum_cols'],
+                            min_cols,
+                            max_cols,
+                            master_info['where'],
+                            missing_flag
                         )
 
-                        # 3. PSQL                        
-                        #unique_id = str(uuid.uuid4())[:8]
+                        # 3. PSQL
                         output_filename = "{0}_{1}_{2}.txt".format(db, table, self.global_ts)
                         local_path = os.path.join(self.config.local_temp_dir, output_filename)
 
@@ -421,9 +508,15 @@ class Worker(threading.Thread):
                         # 4. Copy
                         self.file_h.copy_to_nas(local_path, self.config.nas_dest_base)
 
-                        # Success
-                        self.tracker.add_result(full_name, "SUCCESS", "-")
+                        # Success or Warning
+                        if missing_flag:
+                            warning_msg = "Count/Sum successful, unable to process min/max because the data type mapping file was not found."
+                            self.tracker.add_result(full_name, "WARNING", warning_msg)
+                        else:
+                            self.tracker.add_result(full_name, "SUCCESS", "-")
+
                         self.tracker.log_step(full_name, time.time() - start_t)
+                        self.logger.info("Worker {0} completed table: {1}".format(self.name, full_name))
                         break # Break retry loop on success
 
                     except Exception as e:
@@ -434,7 +527,7 @@ class Worker(threading.Thread):
                         else:
                             # Final Failure
                             self.tracker.add_result(full_name, "FAILED", str(safe_err))
-                            self.logger.error("Failed {0}: {1}".format(full_name, safe_err))
+                            self.logger.error("Worker {0} Failed {1}: {2}".format(self.name, full_name, safe_err))
             
             except Exception as outer_e:
                 safe_err = repr(outer_e)
@@ -567,9 +660,14 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    args.env = os.path.join(main_path, 'config', os.path.basename(args.env))
-    args.master = os.path.join(main_path, 'config', os.path.basename(args.master))
-    args.list = os.path.join(main_path, 'config', os.path.basename(args.list))
+    def resolve_config_path(input_path, base_dir):
+        if os.path.isabs(input_path):
+            return input_path
+        return os.path.join(base_dir, 'config', input_path)
+
+    args.env = resolve_config_path(args.env, main_path)
+    args.master = resolve_config_path(args.master, main_path)
+    args.list = resolve_config_path(args.list, main_path)
 
     run_datetime = datetime.now()
     global_date_folder = run_datetime.strftime("%Y%m%d")
@@ -579,7 +677,13 @@ if __name__ == "__main__":
     final_log_dir = configured_log_dir if configured_log_dir else os.path.join(main_path, 'log')
 
     logger, log_path = setup_logging(final_log_dir, 'gp_export', global_date_folder, global_ts)
+    
+    logger.info("============================================================")
     logger.info("Started with concurrency: {0}".format(args.concurrency))
+    logger.info("Resolved env config path: {0}".format(args.env))
+    logger.info("Resolved master config path: {0}".format(args.master))
+    logger.info("Resolved list file path: {0}".format(args.list))
+    logger.info("============================================================")
 
     try:
         job = GreenplumExportJob(args, logger, log_path, global_date_folder, global_ts, main_path)
