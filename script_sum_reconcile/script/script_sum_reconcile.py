@@ -442,14 +442,13 @@ class HiveLogger(object):
     def __init__(self, spark_session, logger):
         self.spark = spark_session
         self.logger = logger
-        self.target_table = "output_reconcile_sum_columns"
+        self.table_header = "output_reconcile_sum_table_log"
+        self.table_detail = "output_reconcile_sum_column_log"
         self.insert_lock = threading.Lock()
 
-    def log_result(self, execution_id, db, schema, table, partition, start_ts, end_ts, 
-                   duration_exec, duration_table, 
-                   gp_count, sp_count, status, agg_type, col_name, val_gp, val_sp, remark):
-        safe_val_gp = str(val_gp).replace("'", "") if val_gp is not None else ""
-        safe_val_sp = str(val_sp).replace("'", "") if val_sp is not None else ""
+    def log_table_level(self, execution_id, db, schema, table, partition, start_ts, end_ts, 
+                        duration_exec, duration_table, gp_count, sp_count, 
+                        total_metrics, mismatch_metrics, status, remark):
         safe_remark = str(remark).replace("'", "") if remark is not None else ""
         insert_sql = """
             INSERT INTO TABLE {0}
@@ -457,22 +456,47 @@ class HiveLogger(object):
                 '{1}', '{2}', '{3}', '{4}', '{5}',
                 cast('{6}' as timestamp), cast('{7}' as timestamp),
                 cast({8} as decimal(18,2)), cast({9} as decimal(18,2)),
-                {10}, {11}, '{12}',
-                '{13}', '{14}', '{15}', '{16}',
-                '{17}')
+                {10}, {11}, {12}, {13}, '{14}', '{15}'
+            )
         """.format(
-            self.target_table,
-            execution_id, db, schema, table, partition,
+            self.table_header, execution_id, db, schema, table, partition,
             start_ts.strftime('%Y-%m-%d %H:%M:%S'), end_ts.strftime('%Y-%m-%d %H:%M:%S'),
-            duration_exec, duration_table,
-            gp_count, sp_count, status,
-            agg_type, col_name, safe_val_gp, safe_val_sp, safe_remark
+            duration_exec, duration_table, gp_count, sp_count, 
+            total_metrics, mismatch_metrics, status, safe_remark
         )
         try:
             with self.insert_lock:
                 self.spark.sql(insert_sql)
         except Exception as e:
-            self.logger.exception("Hive Insert Failed for {0}".format(partition))
+            self.logger.exception("Hive Table-Level Insert Failed for {0}".format(partition))
+
+    def log_column_level_bulk(self, execution_id, partition, col_buffer):
+        if not col_buffer:
+            return
+            
+        values_list = []
+        for row in col_buffer:
+            func, col, val_gp, val_sp, is_matched, remark = row
+            safe_val_gp = str(val_gp).replace("'", "") if val_gp is not None else ""
+            safe_val_sp = str(val_sp).replace("'", "") if val_sp is not None else ""
+            safe_remark = str(remark).replace("'", "") if remark is not None else ""
+            match_str = "Matched" if is_matched else "Mismatch"
+            
+            val_str = "('{0}', '{1}', '{2}', '{3}', '{4}', '{5}', '{6}', '{7}')".format(
+                execution_id, partition, func, col, safe_val_gp, safe_val_sp, match_str, safe_remark
+            )
+            values_list.append(val_str)
+            
+        insert_sql = """
+            INSERT INTO TABLE {0}
+            VALUES {1}
+        """.format(self.table_detail, ",\n".join(values_list))
+        
+        try:
+            with self.insert_lock:
+                self.spark.sql(insert_sql)
+        except Exception as e:
+            self.logger.exception("Hive Column-Level Bulk Insert Failed for {0}".format(partition))
 
 # ==============================================================================
 # 4. Parallel Workers & Monitor
@@ -594,6 +618,7 @@ class Worker(threading.Thread):
                 is_completed = is_count_matched
                 mismatch_col_count = 0
                 total_metrics = 0
+                col_buffer = []
 
                 if metrics and isinstance(metrics, dict):
                     log_buffer.append("-" * 110)
@@ -661,21 +686,9 @@ class Worker(threading.Thread):
                                 mismatch_col_count += 1
                                 is_completed = False
 
-                            col_status = 'completed' if (is_count_matched and is_col_matched) else 'failed'
-                            self.hive_logger.log_result(
-                                self.execution_id, db, base_schema, base_table, partition,
-                                start_datetime, end_datetime, duration_exec, duration_table,
-                                gp_count, sp_count, col_status, func, col, val_gp_str, val_sp_str, "Matched" if is_col_matched else "Mismatch"
-                            )
+                            col_buffer.append((func, col, val_gp_str, val_sp_str, is_col_matched, "Data Comparison"))
                     
                     log_buffer.append("-" * 110)
-                else:
-                    final_status = 'completed' if is_completed else 'failed'
-                    self.hive_logger.log_result(
-                        self.execution_id, db, base_schema, base_table, partition,
-                        start_datetime, end_datetime, duration_exec, duration_table,
-                        gp_count, sp_count, final_status, "COUNT_ONLY", "N/A", str(gp_count), str(sp_count), "Matched" if is_completed else "Count Mismatch"
-                    )
 
                 if log_buffer:
                     with self.tracker.lock:
@@ -699,6 +712,13 @@ class Worker(threading.Thread):
                     remark_msg += " | " + status_remark
 
                 self.tracker.add_result(partition, final_status, gp_count, sp_count, duration_table, remark_msg)
+                
+                self.hive_logger.log_table_level(
+                    self.execution_id, db, base_schema, base_table, partition,
+                    start_datetime, end_datetime, duration_exec, duration_table,
+                    gp_count, sp_count, total_metrics, mismatch_col_count, final_status.lower(), remark_msg
+                )
+                self.hive_logger.log_column_level_bulk(self.execution_id, partition, col_buffer)
 
 
             except ValueError as ve:
@@ -708,12 +728,11 @@ class Worker(threading.Thread):
                 msg = str(ve)
                 status = "SKIPPED" if "SKIPPED" in msg else "FAILED"
                 self.tracker.add_result(partition, status, remark=msg)
-                
-                self.hive_logger.log_result(
+                self.hive_logger.log_table_level(
                     self.execution_id, db, base_schema, base_table, partition,
                     start_datetime, datetime.now(), duration_exec, duration_table, 
-                    0, 0, status.lower(), "N/A", 0, 0, msg
-                )
+                    0, 0, 0, 0, status.lower(), msg
+                )                
             except Exception as e:
                 duration_table = time.time() - start_t
                 duration_exec = time.time() - self.tracker.start_time
@@ -733,13 +752,11 @@ class Worker(threading.Thread):
                     clear_remark = "Error: {0}".format(err_msg[:40] + "..." if len(err_msg) > 40 else err_msg)
 
                 self.logger.warning("Worker {0} failed on {1}: {2}".format(self.name, partition, safe_err))
-                
                 self.tracker.add_result(partition, "FAILED", remark=clear_remark)
-                
-                self.hive_logger.log_result(
+                self.hive_logger.log_table_level(
                     self.execution_id, db, base_schema, base_table, partition,
                     start_datetime, datetime.now(), duration_exec, duration_table, 
-                    0, 0, "failed", "N/A", "0", "0", safe_err
+                    0, 0, 0, 0, "failed", clear_remark + " | " + safe_err[:200]
                 )
             finally:
                 self.queue.task_done()
