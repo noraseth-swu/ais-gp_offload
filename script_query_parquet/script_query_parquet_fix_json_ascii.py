@@ -481,32 +481,22 @@ class ConfigManager(object):
             return False
 
     def _load_thai_mapping(self):
-            if not os.path.exists(self.thai_mapping_export_full_path): return
-            try:
-                with open(self.thai_mapping_export_full_path, 'r') as f:
-                    reader = csv.DictReader(f)
-                    for row in reader:
-                        db = row.get('database_name', '').strip().lower()
-                        tbl_raw = row.get('original_table_name', '').strip().lower()
-
-                        if '.' in tbl_raw:
-                            parts = tbl_raw.split('.')
-                            sch = parts[-2]
-                            tbl = parts[-1]
-                        else:
-                            sch = ""
-                            tbl = tbl_raw
-
-                        col = row.get('th_column_name', '').strip().lower()
-                        flag = row.get('active_flag', '').strip().upper()
-
-                        if db and tbl and col:
-                            key = (db, sch, tbl)
-                            if key not in self.thai_dict: self.thai_dict[key] = {}
-                            self.thai_dict[key][col] = flag
-                self.logger.info("Loaded Thai mapping configuration for {0} tables.".format(len(self.thai_dict)))
-            except Exception as e:
-                self.logger.error("Error loading Thai mapping CSV: {0}".format(e))
+        if not os.path.exists(self.thai_mapping_export_full_path): return
+        try:
+            with open(self.thai_mapping_export_full_path, 'r') as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    db = row.get('database_name', '').strip().lower()
+                    tbl_raw = row.get('original_table_name', '').strip().lower()
+                    tbl = tbl_raw.split('.')[-1] if '.' in tbl_raw else tbl_raw
+                    col = row.get('th_column_name', '').strip().lower()
+                    flag = row.get('active_flag', '').strip().upper()
+                    if db and tbl and col:
+                        if (db, tbl) not in self.thai_dict: self.thai_dict[(db, tbl)] = {}
+                        self.thai_dict[(db, tbl)][col] = flag
+            self.logger.info("Loaded Thai mapping configuration for {0} tables.".format(len(self.thai_dict)))
+        except Exception as e:
+            self.logger.error("Error loading Thai mapping CSV: {0}".format(e))
 
 # ==============================================================================
 # 3. Handler & Helper Classes
@@ -1582,38 +1572,64 @@ class Worker(threading.Thread):
                 self.name = "{0}-{1}".format(self.base_name, partition)
                 start_datetime = datetime.now()
                 start_t = time.time()
-
+    
                 table = task['partition'].lower()
                 full_name = "{0}.{1}.{2}".format(db, schema, table)
-
+    
                 self.db = db
                 self.schema = schema
                 self.short_name = "{0}.{1}".format(self.schema, table)
                 self.start_time_tbl = start_t
                 self.start_ts_tbl = datetime.fromtimestamp(start_t).strftime("%Y-%m-%d %H:%M:%S")
                 self.reconcile_method = ['count']
-
+    
                 status = "FAILED"
                 remark = ""
-                nas_json_path = ""
-                hdfs_dest = ""
-
+                nas_json_path = "-"
+                hdfs_dest = "-"
+    
                 base_table = partition.split('_1_prt_')[0] if '_1_prt_' in partition else partition
-
+    
+                target_special = ['drm_s_alp_mis018000136_run_out_of_balace_period', 'fbb_iig_calculation_report_fbb']
+                is_target = any(t in partition.lower() for t in target_special)
+    
+                def force_utf8_read(val):
+                    if val is None: return ""
+                    if isinstance(val, unicode): return val.encode('utf-8', 'ignore')
+                    if isinstance(val, str):
+                        try: return val.decode('utf-8').encode('utf-8')
+                        except: return val.decode('tis-620', 'ignore').encode('utf-8', 'ignore')
+                    return str(val)
+    
+                def ensure_unicode(s):
+                    if s is None: return u""
+                    if isinstance(s, unicode): return s
+                    try: return s.decode('utf-8')
+                    except: return s.decode('tis-620', 'ignore')
+    
+                def safe_utf8(data):
+                    if isinstance(data, dict):
+                        return collections.OrderedDict((safe_utf8(k), safe_utf8(v)) for k, v in data.items())
+                    elif isinstance(data, list):
+                        return [safe_utf8(x) for x in data]
+                    elif isinstance(data, unicode):
+                        return data.encode('utf-8', 'ignore')
+                    return data
+    
                 try:
                     self.tracker.update_worker_status(self.base_name, "[BUSY] {0}".format(partition))
-
+    
                     log_row, log_msg = self.log_parser.get_latest_succeed_info(db, schema, partition)
                     if not log_row:
                         raise ValueError(log_msg)
-
+    
                     source_count = parse_source_count(
                         log_row.get('Greenplum_Num_Record', ''),
                         self.worker_logger,
                         "[{0}]".format(self.name)
                     )
                     source_is_zero = (source_count == 0)
-
+    
                     if not source_is_zero:
                         hdfs_from_stat, sync_status = self._read_hdfs_sync_status(db, schema, partition)
                         if not sync_status:
@@ -1628,46 +1644,62 @@ class Worker(threading.Thread):
                     else:
                         hdfs_dest = "-"
                         self.worker_logger.info("[{0}] Source_Count=0. Skip HDFS parquet checks and build null-structured JSON.".format(self.name))
-
+    
                     type_map, meta_file_path = self.meta_fetcher.fetch_data_types(db, schema, partition, fallback_table=base_table)
+                    
+                    if type_map:
+                        safe_type_map = collections.OrderedDict()
+                        for k, v in type_map.items():
+                            safe_k = force_utf8_read(k)
+                            safe_v = {
+                                'ext_name': force_utf8_read(v.get('ext_name', '')),
+                                'data_type': force_utf8_read(v.get('data_type', ''))
+                            }
+                            safe_type_map[safe_k] = safe_v
+                        type_map = safe_type_map
+    
                     if meta_file_path:
                         meta_filename = os.path.basename(meta_file_path)
-                        self.logger.info("[{0}] >>> Table: {1} | Metadata File: {2}".format(self.name, partition, meta_filename))
+                        meta_log_msg = u"[{0}] >>> Table: {1} | Metadata File: {2}".format(self.name, partition, meta_filename)
+                        self.logger.info(meta_log_msg.encode('utf-8'))
+                        self.worker_logger.info(meta_log_msg.encode('utf-8'))
                     else:
                         self.logger.warning("[{0}] >>> Table: {1} | Metadata File: NOT FOUND".format(self.name, partition))
-                    self.worker_logger.info("[{0}] Metadata file used: {1}".format(self.name, meta_file_path))
+                        self.worker_logger.info("[{0}] Metadata file used: None".format(self.name))
+                    
                     missing_meta = True if type_map is None else False
-
-                    # // ADDED: Clean type map for logic that requires simple dict structure
+    
                     clean_type_map = {}
                     if not missing_meta:
                         for gp_k, info in type_map.items():
                             clean_type_map[gp_k] = info['data_type']
-
+    
                     master_info = self.config.master_data.get((db, schema, base_table), {'manual_num': []})
-
+    
                     manual_num_err = []
                     new_master_info = {'manual_num': []}
                     if not missing_meta: 
                         new_master_info, manual_num_err = self._check_manual_num(master_info, clean_type_map)
-
+    
                     cat_cols = {'SUM_MIN_MAX': [], 'MIN_MAX': [], 'MD5_MIN_MAX': [], 'TYPE_MAP': clean_type_map, 
                                 'MANUAL_NUM': new_master_info['manual_num']}
-
-                    thai_config = self.config.thai_dict.get((db.lower(), schema.lower(), partition.lower()), {})
+    
+                    thai_config = self.config.thai_dict.get((db.lower(), partition.lower()), {})
                     if not thai_config:
-                        thai_config = self.config.thai_dict.get((db.lower(), schema.lower(), base_table.lower()), {})                
-
+                        thai_config = self.config.thai_dict.get((db.lower(), base_table.lower()), {})                
+    
                     if not missing_meta:
                         for col, info in type_map.items():
                             gp_dt = info['data_type']
                             gp_base = gp_dt.split('(')[0].strip().lower()
-                            thai_flag = thai_config.get(col.lower())
+                            
+                            safe_col_lower = force_utf8_read(col).lower()
+                            thai_flag = thai_config.get(safe_col_lower)
                             if thai_flag == 'Y':
                                 gp_base = 'thai_col_flag_y'
                             elif thai_flag == 'N':
                                 gp_base = 'thai_col_flag_n'
-
+    
                             if gp_base in self.config.type_mapping.get("SUM_MIN_MAX", []):
                                 cat_cols['SUM_MIN_MAX'].append(col)
                                 self.reconcile_method.append('number_sum_min_max')
@@ -1680,63 +1712,79 @@ class Worker(threading.Thread):
                             elif gp_base in self.config.list_datatype_conv_only_no_len and '(' not in gp_dt:
                                 cat_cols['MD5_MIN_MAX'].append(col)
                                 self.reconcile_method.append('md5_min_max')
-
-                    # // MODIFIED: Pass type_map (containing ext_name) to build mapping-aware aggregate expressions
+    
                     agg_exprs = self.query_builder.build_agg_exprs(cat_cols, type_map or {})
-
+    
                     final_json = collections.OrderedDict()
                     final_json["table"] = "{0}.{1}.{2}".format(db, schema, partition)
                     final_json["source_type"] = "parquet"
                     final_json["methods"] = collections.OrderedDict()
-
+    
                     if source_is_zero:
                         final_json["count"] = 0
                         sum_cols = sorted(set(cat_cols.get('SUM_MIN_MAX', []) + cat_cols.get('MANUAL_NUM', [])))
                         min_max_cols = sorted(set(cat_cols.get('MIN_MAX', [])))
                         md5_cols = sorted(set(cat_cols.get('MD5_MIN_MAX', [])))
-
+    
                         if sum_cols:
                             final_json["methods"]["SUM_MIN_MAX"] = collections.OrderedDict()
                             for col in sum_cols:
-                                final_json["methods"]["SUM_MIN_MAX"][col] = collections.OrderedDict()
-                                final_json["methods"]["SUM_MIN_MAX"][col]["data_type"] = clean_type_map.get(col, "unknown")
-                                final_json["methods"]["SUM_MIN_MAX"][col]["sum"] = None
-                                final_json["methods"]["SUM_MIN_MAX"][col]["min"] = None
-                                final_json["methods"]["SUM_MIN_MAX"][col]["max"] = None
-
+                                # // MODIFIED: Use gp_column_nm (col) with UTF-8 enforcement for 0 records
+                                ext_key = force_utf8_read(col)
+                                final_json["methods"]["SUM_MIN_MAX"][ext_key] = collections.OrderedDict()
+                                final_json["methods"]["SUM_MIN_MAX"][ext_key]["data_type"] = clean_type_map.get(col, "unknown")
+                                final_json["methods"]["SUM_MIN_MAX"][ext_key]["sum"] = None
+                                final_json["methods"]["SUM_MIN_MAX"][ext_key]["min"] = None
+                                final_json["methods"]["SUM_MIN_MAX"][ext_key]["max"] = None
+    
                         if min_max_cols:
                             final_json["methods"]["MIN_MAX"] = collections.OrderedDict()
                             for col in min_max_cols:
-                                final_json["methods"]["MIN_MAX"][col] = collections.OrderedDict()
-                                final_json["methods"]["MIN_MAX"][col]["data_type"] = clean_type_map.get(col, "unknown")
-                                final_json["methods"]["MIN_MAX"][col]["min"] = None
-                                final_json["methods"]["MIN_MAX"][col]["max"] = None
-
+                                # // MODIFIED: Use gp_column_nm (col) with UTF-8 enforcement for 0 records
+                                ext_key = force_utf8_read(col)
+                                final_json["methods"]["MIN_MAX"][ext_key] = collections.OrderedDict()
+                                final_json["methods"]["MIN_MAX"][ext_key]["data_type"] = clean_type_map.get(col, "unknown")
+                                final_json["methods"]["MIN_MAX"][ext_key]["min"] = None
+                                final_json["methods"]["MIN_MAX"][ext_key]["max"] = None
+    
                         if md5_cols:
                             final_json["methods"]["MD5_MIN_MAX"] = collections.OrderedDict()
                             for col in md5_cols:
-                                final_json["methods"]["MD5_MIN_MAX"][col] = collections.OrderedDict()
-                                final_json["methods"]["MD5_MIN_MAX"][col]["data_type"] = clean_type_map.get(col, "unknown")
-                                final_json["methods"]["MD5_MIN_MAX"][col]["min_md5"] = None
-                                final_json["methods"]["MD5_MIN_MAX"][col]["max_md5"] = None
+                                # // MODIFIED: Use gp_column_nm (col) with UTF-8 enforcement for 0 records
+                                ext_key = force_utf8_read(col)
+                                final_json["methods"]["MD5_MIN_MAX"][ext_key] = collections.OrderedDict()
+                                final_json["methods"]["MD5_MIN_MAX"][ext_key]["data_type"] = clean_type_map.get(col, "unknown")
+                                final_json["methods"]["MD5_MIN_MAX"][ext_key]["min_md5"] = None
+                                final_json["methods"]["MD5_MIN_MAX"][ext_key]["max_md5"] = None
                     else:
                         self.spark.sparkContext.setJobGroup(partition, "Query: " + partition)
                         parquet_read_path = self._resolve_parquet_path(hdfs_dest)
                         df = self.spark.read.parquet(parquet_read_path)
-
-                        # // REMOVED: Rename block is removed to use ext_column_nm directly in Query Builder
-
+    
+                        if is_target and not missing_meta:
+                            def normalize_name(n):
+                                u_n = ensure_unicode(n)
+                                return re.sub(r'[^a-z0-9]', '', u_n.lower())
+                            
+                            parquet_actual_cols = {normalize_name(c): c for c in df.columns}
+                            for gp_name, info in type_map.items():
+                                norm_ext = normalize_name(info['ext_name'])
+                                if norm_ext in parquet_actual_cols:
+                                    info['ext_name'] = force_utf8_read(parquet_actual_cols[norm_ext])
+    
+                        agg_exprs = self.query_builder.build_agg_exprs(cat_cols, type_map or {})
+    
                         self._log_reconcile_column_usage(partition, cat_cols, df.dtypes)
                         self.worker_logger.info("Worker {0} executing Spark Action for {1}...".format(self.name, partition))
-
+    
                         agg_result = df.agg(*agg_exprs).collect()
                         if not agg_result:
                             raise RuntimeError("Spark aggregation returned empty result for {0}".format(partition))
-
+    
                         sp_row = agg_result[0]
                         sp_res = sp_row.asDict()
                         self.spark.sparkContext.setLocalProperty("spark.jobGroup.id", None)
-
+    
                         def format_val(v):
                             if v is None: return None
                             v_str = str(v)
@@ -1745,82 +1793,84 @@ class Worker(threading.Thread):
                                     return "{:f}".format(Decimal(v_str))
                                 except Exception:
                                     pass
-                            return v
-
+                            return force_utf8_read(v) 
+    
                         final_json["count"] = int(sp_res.pop("count", 0))
-
+    
                         parsed_res = {}
                         for k, v in sp_res.items():
-                            parts = k.split('|')
+                            parts = force_utf8_read(k).split('|')
                             if len(parts) == 3:
                                 method, col, func = parts
                                 if method not in parsed_res: parsed_res[method] = {}
                                 if col not in parsed_res[method]: parsed_res[method][col] = {}
                                 parsed_res[method][col][func] = format_val(v)
-
+    
                         for method in ["SUM_MIN_MAX", "MIN_MAX", "MD5_MIN_MAX"]:
                             if method in parsed_res:
                                 final_json["methods"][method] = collections.OrderedDict()
                                 for col in sorted(parsed_res[method].keys()):
-                                    final_json["methods"][method][col] = collections.OrderedDict()
-                                    final_json["methods"][method][col]["data_type"] = clean_type_map.get(col, "unknown")
+                                    ext_actual_key = type_map[col]['ext_name'] if not missing_meta else col
+                                    final_json["methods"][method][ext_actual_key] = collections.OrderedDict()
+                                    final_json["methods"][method][ext_actual_key]["data_type"] = clean_type_map.get(col, "unknown")
                                     for f in ["sum", "min", "max", "min_md5", "max_md5"]:
                                         if f in parsed_res[method][col]:
-                                            final_json["methods"][method][col][f] = parsed_res[method][col][f]
-
-                    # // RESTORED: Query SQL write block
+                                            final_json["methods"][method][ext_actual_key][f] = parsed_res[method][col][f]
+    
                     query_file_name = "query_{0}_{1}_{2}_{3}.sql".format(db, schema, partition, self.global_ts)
                     local_query_file = os.path.join(self.out_path, query_file_name)
-
+    
                     try:
-                        with open(local_query_file, 'w') as f:
-                            f.write("-- PySpark Aggregation Expressions for {0}\n".format(partition))
+                        with open(local_query_file, 'wb') as f:
+                            f.write("-- PySpark Aggregation Expressions for {0}\n".format(partition).encode('utf-8'))
                             for expr in agg_exprs:
-                                f.write(str(expr) + "\n")
+                                f.write(ensure_unicode(str(expr)).encode('utf-8') + b"\n")
                     except IOError as e:
-                        raise IOError("Failed to save local SQL file {0}: {1}".format(local_query_file, e))
-
+                        self.worker_logger.warning("[{0}] SQL Write Error: {1}".format(self.name, e))
+    
                     out_file_name = "parquet_{0}_{1}_{2}_{3}.json".format(db, schema, partition, self.global_ts)
                     self.local_json_file = os.path.join(self.out_path, out_file_name)
-
+    
                     try:
                         with open(self.local_json_file, 'w') as f:
-                            json.dump(final_json, f)
+                            json.dump(safe_utf8(final_json), f, ensure_ascii=False)
                     except IOError as e:
                         raise IOError("Failed to save local JSON output {0}: {1}".format(self.local_json_file, e))
-
+    
                     copy_success, copy_err = self._copy_file_to_nas(self.local_json_file, db, schema, out_file_name)
-
+    
                     nas_dir = os.path.join(self.config.nas_destination, db, schema)
                     nas_json_path = os.path.join(nas_dir, out_file_name)
-
+    
                     json_exists = os.path.exists(nas_json_path)
                     if copy_success and json_exists:
                         self.worker_logger.info("Worker {0} successfully saved and copied JSON to NAS for {1}".format(self.name, partition))
                         status = "SUCCESS"
                         if source_is_zero:
                             remark = "JSON Generated (Source_Count=0; null-structured result)."
+                        elif is_target:
+                            remark = "JSON Generated (Special Discovery Mode)."
                         else:
                             remark = "JSON Generated."
                     else:
                         self.worker_logger.error("Worker {0} failed NAS sync for {1}. JSON Err: {2}".format(
                             self.name, partition, copy_err))
-
                         status = "FAILED"
+                        nas_json_path = "-"
                         err_remarks = []
                         if not copy_success: err_remarks.append("JSON Copy Error ({0})".format(copy_err))
                         if not json_exists: err_remarks.append("JSON Not Found on NAS")
                         remark = " | ".join(err_remarks)
-
+    
                     duration = time.time() - start_t
                     if missing_meta:
                         remark = "Metadata Missing (Count-only) | " + remark
                     if manual_num_err:
                         status = "FAILED"
                         remark = "{0} | {1}".format(remark, ",".join(manual_num_err))
-
+    
                     self.tracker.add_result(partition, status, duration, remark)
-
+    
                 except ValueError as ve:
                     remark = str(ve)
                     if "SKIPPED" in remark:
@@ -1830,6 +1880,15 @@ class Worker(threading.Thread):
                         status = "FAILED"
                     self.tracker.add_result(partition, status, time.time() - start_t, remark)
                 except Exception as e:
+                    import traceback
+                    try:
+                        raw_tb = traceback.format_exc()
+                        safe_tb = raw_tb.encode('utf-8', 'replace') if isinstance(raw_tb, unicode) else raw_tb.decode('utf-8', 'ignore').encode('utf-8', 'replace')
+                        err_msg_full = safe_tb.replace("'", "")
+                    except:
+                        err_msg_full = "Traceback error fallback"
+                    self.worker_logger.error("[{0}] Worker Error Traceback:\n{1}".format(self.name, err_msg_full))
+                    
                     remark = str(e)
                     status = "FAILED"
                     self.worker_logger.warning("Worker {0} failed on {1}: {2}".format(self.name, partition, e))
@@ -1845,7 +1904,7 @@ class Worker(threading.Thread):
                         self.worker_logger.info("Worker {0} logging status for {1}...".format(self.name, full_name))
                         self.logging_status(status, remark, nas_json_path, hdfs_dest)
                     except Exception as e:
-                        self.worker_logger.error("Failed writing logging_status for {}: {}".format(full_name, e))
+                        self.worker_logger.error("Failed writing logging_status for {0}: {1}".format(full_name, e))
                     self.queue.task_done()
 
 class UploadWorker(threading.Thread):
