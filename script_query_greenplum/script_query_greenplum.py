@@ -562,11 +562,12 @@ class Config(object):
 # ==============================================================================
 
 class QueryBuilder(object):
-    def __init__(self, temp_dir, env_params, logger, global_ts):
+    def __init__(self, temp_dir, env_params, logger, global_ts, set_max_stack_depth='n'):
         self.temp_dir = temp_dir
         self.env_params = env_params
         self.logger = logger
         self.global_ts = global_ts
+        self.set_max_stack_depth = set_max_stack_depth.lower()
 
     def _quote_json_val(self, sql_expr):
         return "COALESCE('\"' || ({0})::text || '\"', 'null')".format(sql_expr)
@@ -651,10 +652,11 @@ class QueryBuilder(object):
             # Assemble Final SQL
             metrics_sql = " || ', ' || ".join(method_groups) if method_groups else "''"
             
+            stack_depth_stmt = "SET max_stack_depth = '6MB';\n" if self.set_max_stack_depth == 'y' else ""
             # Construct single JSON object string
             if ctas_table:
                 sql = (
-                    "SET max_stack_depth = '6MB';"
+                    "{4}"
                     "SELECT '{{' || "
                     " '\"table\": \"{0}\", ' || "
                     " '\"source_type\": \"greenplum\", ' || "
@@ -662,10 +664,10 @@ class QueryBuilder(object):
                     " '\"methods\": {{' || {1} || '}}' || "
                     " '}}' "
                     "FROM ONLY \"{2}\".\"{3}\";"
-                ).format(full_table_name, metrics_sql, ctas_schema, ctas_table)
+                ).format(full_table_name, metrics_sql, ctas_schema, ctas_table, stack_depth_stmt)
             else:
                 sql = (
-                    "SET max_stack_depth = '6MB';"
+                    "{4}"
                     "SELECT '{{' || "
                     " '\"table\": \"{0}\", ' || "
                     " '\"source_type\": \"greenplum\", ' || "
@@ -673,7 +675,7 @@ class QueryBuilder(object):
                     " '\"methods\": {{' || {1} || '}}' || "
                     " '}}' "
                     "FROM ONLY \"{2}\".\"{3}\";"
-                ).format(full_table_name, metrics_sql, schema, table)
+                ).format(full_table_name, metrics_sql, schema, table, stack_depth_stmt)
 
             filename = "query_{0}_{1}_{2}_{3}.sql".format(db, schema, table, self.global_ts)
             filepath = os.path.join(self.temp_dir, filename)
@@ -1053,7 +1055,7 @@ class Worker(threading.Thread):
                                         # match "column_name;logic"
                                         m = re.match(r'^([^;]+);(.*)', line)
                                         if m:
-                                            cur_col = m.group(1).strip().lower()
+                                            cur_col = m.group(1).strip()
                                             insert_logic_dict[cur_col] = m.group(2)
                                         elif cur_col:
                                             insert_logic_dict[cur_col] += " " + line
@@ -1063,18 +1065,21 @@ class Worker(threading.Thread):
                                     insert_logic_dict[col] = re.sub(r'(?i)\s+AS\s+(?:"[^"]+"|[a-zA-Z0-9_]+)(?:\s*)$', '', logic).strip()
 
                             # Categorize
-                            cat_cols = {'SUM_MIN_MAX': [], 'MIN_MAX': [], 'MD5_MIN_MAX': [], 'TYPE_MAP': {}, 'MANUAL_NUM': master_info['manual_num']}
+                            cat_cols = {'SUM_MIN_MAX': [], 'MIN_MAX': [], 'MD5_MIN_MAX': [], 'TYPE_MAP': {}, 'MANUAL_NUM': []}
                             if dt_file:
                                 with open(dt_file, 'r') as f:
                                     reader = csv.DictReader(f, delimiter='|')
                                     for row in reader:
-                                        col_nm = row.get('gp_column_nm', '').strip().lower()
+                                        col_nm = row.get('gp_column_nm', '').strip()
                                         gp_dt = row.get('gp_datatype', '').strip()
 
                                         if col_nm and gp_dt:
                                             cat_cols['TYPE_MAP'][col_nm] = gp_dt
                                             gp_base = gp_dt.split('(')[0].strip().lower()
                                             t_flag = thai_config.get(col_nm.lower())
+
+                                            if col_nm.lower() in master_info['manual_num']:
+                                                cat_cols['MANUAL_NUM'].append(col_nm)
 
                                             if t_flag == 'Y':
                                                 gp_base = 'thai_col_flag_y'
@@ -1220,7 +1225,7 @@ class GreenplumExportJob(object):
         # Init Helpers
         self.config = Config(env_config_path=args.env, master_config_path=args.master, list_file_path=args.list, cli_tables=args.table_name, logger=logger, global_ts=self.global_ts, run_id=self.run_id, date_folder=global_date_folder, main_path=main_path)
         self.log_parser = LogParser(self.config.succeed_path, logger)
-        self.builder = QueryBuilder(self.config.local_temp_dir, self.config.env_params, logger, self.global_ts)
+        self.builder = QueryBuilder(self.config.local_temp_dir, self.config.env_params, logger, self.global_ts, args.set_max_stack_depth)
         self.shell = ShellHandler(logger)
         self.file_h = FileHandler(logger)
         self.status_file_locks = {}
@@ -1293,6 +1298,7 @@ if __name__ == "__main__":
     parser.add_argument('--env', default='env_config.txt', help='Name of env config file')
     parser.add_argument('--master', help='Name of master config file')
     parser.add_argument('--concurrency', default=4, type=int, help='Number of parallel workers (Default: 4)')
+    parser.add_argument('--set_max_stack_depth', choices=['y', 'n'], default='n', help='Flag to set max_stack_depth to 6MB (y/n, Default: n)')
     
     # handle table and list
     group = parser.add_mutually_exclusive_group()
@@ -1327,6 +1333,7 @@ if __name__ == "__main__":
     logger.info("Resolved env config path: {0}".format(args.env))
     logger.info("Resolved master config path: {0}".format(final_config_master_file_path))
     logger.info("Resolved list file path: {0}".format(args.list))
+    logger.info("Flag set_max_stack_depth: {0}".format(args.set_max_stack_depth))
     logger.info("================================================================================")
 
     try:
