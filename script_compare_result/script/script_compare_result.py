@@ -327,9 +327,18 @@ class SucceededLogValidator(object):
             if source == 'gp':
                 pattern = os.path.join(base_path, "*", db, schema, "stat_csv", "log_stat_rc_*.csv")
             else:
-                pattern = os.path.join(base_path, "*", db, schema, "stat_csv", "log_stat_rc_{0}_list_reconcile_pq*.csv".format(db))
+                pattern = os.path.join(base_path, "*", db, schema, "stat_csv", "log_stat_rc_*.csv")
             self.logger.info("LogValidator [{0}]: Searching log files using pattern: {1}".format(source, pattern))
-            matched_files = sorted(glob.glob(pattern), reverse=True)
+            import re
+            def extract_ts(fname):
+                # Try to extract the last YYYYMMDD_HHMMSS in the filename
+                m = re.findall(r'(\d{8}_\d{6})', os.path.basename(fname))
+                if m:
+                    # Convert to sortable int (YYYYMMDDHHMMSS)
+                    return int(m[-1].replace('_',''))
+                return 0  # fallback: treat as oldest
+
+            matched_files = sorted(glob.glob(pattern), key=extract_ts, reverse=True)
 
             if not matched_files:
                 self.logger.warning("LogValidator [{0}]: No log files found for {1}.{2} using pattern: {3}".format(source, db, schema, pattern))
@@ -437,7 +446,10 @@ class JsonHandler(object):
             return None, "File not found: {0}".format(file_path)
         try:
             with open(file_path, 'r') as f:
-                return json.load(f), None
+                raw_data = f.read()
+            clean_bytes = raw_data.decode('utf-8', errors='ignore').encode('utf-8')
+            data = json.loads(clean_bytes)
+            return data, None
         except Exception as e:
             return None, "Invalid JSON: {0}".format(e)
 

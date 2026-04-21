@@ -537,7 +537,7 @@ class SparkQueryBuilder(object):
             # DECIMAL(38,0) prevents SUM overflow that BIGINT (64-bit, ~9.2e18) cannot guarantee
             p, s, r = 38, 0, 0
 
-        # Build SparkSQL String Expression — Apply Cast -> Aggregate -> Round -> Cast to String
+        # Build SparkSQL String Expression - Apply Cast -> Aggregate -> Round -> Cast to String
         # Handle cast overflow in int/smallint/bigint cast to decimal(38,0)
         return "CAST(ROUND({0}(CAST(`{1}` AS DECIMAL({2},{3}))), {4}) AS STRING)".format(
             agg_func, col, p, s, r
