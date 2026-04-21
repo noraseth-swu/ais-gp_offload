@@ -288,7 +288,8 @@ class ConfigManager(object):
                     db_part, tbl_part = t.split('|')
                     sch_part, real_tbl = tbl_part.split('.')
                     if db_part and sch_part and real_tbl:
-                        table_key = (db_part.strip(), sch_part.strip(), real_tbl.strip())
+                        # table_key = (db_part.strip(), sch_part.strip(), real_tbl.strip())
+                        table_key = (db_part.strip(), sch_part.strip(), real_tbl)
                         if table_key in seen_tables:
                             self.logger.warning("Duplicate table found and removed: {0}".format(t.strip()))
                             continue
@@ -310,13 +311,15 @@ class ConfigManager(object):
             try:
                 with open(list_file_path, 'r') as f:
                     for line in f:
-                        line = line.strip().lower()
+                        # line = line.strip().lower()
+                        line = line.rstrip('\r\n').lower()
                         if not line or line.startswith('#'): continue
                         try:
                             db_part, tbl_part = line.split('|')
                             sch_part, real_tbl = tbl_part.split('.')
                             if db_part and sch_part and real_tbl:
-                                table_key = (db_part.strip(), sch_part.strip(), real_tbl.strip())
+                                # table_key = (db_part.strip(), sch_part.strip(), real_tbl.strip())
+                                table_key = (db_part.strip(), sch_part.strip(), real_tbl)
                                 if table_key in seen_tables:
                                     self.logger.warning("Duplicate table found and removed in list file: {0}".format(line))
                                     continue
@@ -478,22 +481,32 @@ class ConfigManager(object):
             return False
 
     def _load_thai_mapping(self):
-        if not os.path.exists(self.thai_mapping_export_full_path): return
-        try:
-            with open(self.thai_mapping_export_full_path, 'r') as f:
-                reader = csv.DictReader(f)
-                for row in reader:
-                    db = row.get('database_name', '').strip().lower()
-                    tbl_raw = row.get('original_table_name', '').strip().lower()
-                    tbl = tbl_raw.split('.')[-1] if '.' in tbl_raw else tbl_raw
-                    col = row.get('th_column_name', '').strip().lower()
-                    flag = row.get('active_flag', '').strip().upper()
-                    if db and tbl and col:
-                        if (db, tbl) not in self.thai_dict: self.thai_dict[(db, tbl)] = {}
-                        self.thai_dict[(db, tbl)][col] = flag
-            self.logger.info("Loaded Thai mapping configuration for {0} tables.".format(len(self.thai_dict)))
-        except Exception as e:
-            self.logger.error("Error loading Thai mapping CSV: {0}".format(e))
+            if not os.path.exists(self.thai_mapping_export_full_path): return
+            try:
+                with open(self.thai_mapping_export_full_path, 'r') as f:
+                    reader = csv.DictReader(f)
+                    for row in reader:
+                        db = row.get('database_name', '').strip().lower()
+                        tbl_raw = row.get('original_table_name', '').strip().lower()
+
+                        if '.' in tbl_raw:
+                            parts = tbl_raw.split('.')
+                            sch = parts[-2]
+                            tbl = parts[-1]
+                        else:
+                            sch = ""
+                            tbl = tbl_raw
+
+                        col = row.get('th_column_name', '').strip().lower()
+                        flag = row.get('active_flag', '').strip().upper()
+
+                        if db and tbl and col:
+                            key = (db, sch, tbl)
+                            if key not in self.thai_dict: self.thai_dict[key] = {}
+                            self.thai_dict[key][col] = flag
+                self.logger.info("Loaded Thai mapping configuration for {0} tables.".format(len(self.thai_dict)))
+            except Exception as e:
+                self.logger.error("Error loading Thai mapping CSV: {0}".format(e))
 
 # ==============================================================================
 # 3. Handler & Helper Classes
@@ -506,10 +519,7 @@ class SparkQueryBuilder(object):
         self.logger = logger
 
     def _build_num_expr(self, agg_func, col, gp_type):
-        """ REQ 5.1: Numeric Type handling with precision, scale and rounding """
         gp_base = gp_type.split('(')[0].strip().lower()
-        
-        # 1. Defaults
         p, s, r = 38, 10, 5
 
         if gp_base == 'numeric' and '(' in gp_type:
@@ -525,7 +535,7 @@ class SparkQueryBuilder(object):
                 else:
                     p = parsed_p
                     s = parsed_s
-                    r = s # SLA: Rounding equals scale if defined
+                    r = s 
             except: pass
         elif gp_base == 'numeric':
             p, s, r = self.env_params['default_numeric_p'], self.env_params['default_numeric_s'], self.env_params['round_numeric']
@@ -534,89 +544,82 @@ class SparkQueryBuilder(object):
         elif gp_base == 'real':
             p, s, r = self.env_params['cast_real_p'], self.env_params['cast_real_s'], self.env_params['round_real']
         elif gp_base in ['smallint', 'integer', 'bigint']:
-            # DECIMAL(38,0) prevents SUM overflow that BIGINT (64-bit, ~9.2e18) cannot guarantee
             p, s, r = 38, 0, 0
 
-        # Build SparkSQL String Expression — Apply Cast -> Aggregate -> Round -> Cast to String
-        # Handle cast overflow in int/smallint/bigint cast to decimal(38,0)
+        # // NOTE: Uses backticks `{1}` to safely query column names with spaces or special chars
         return "CAST(ROUND({0}(CAST(`{1}` AS DECIMAL({2},{3}))), {4}) AS STRING)".format(
             agg_func, col, p, s, r
         )
 
     def _build_date_expr(self, agg_func, col, gp_type):
-        # Step 1: Base Regex Cleansing
         clean_str = "CAST(`{0}` AS STRING)".format(col)
         clean_str = "regexp_replace({0}, '^[0-9]{{5,}}-', '9999-')".format(clean_str)
         clean_str = "regexp_replace({0}, '24:00:00', '23:59:59')".format(clean_str)
         clean_str = "regexp_replace({0}, '([+-][0-9]{{2}}:[0-9]{{2}}):[0-9]{{2}}', '$1')".format(clean_str)
         clean_str = "regexp_replace({0}, '\\\\.[0-9]+', '')".format(clean_str)
 
-        # Step 2: Specific Data Type Parsing
         ts_parse = ""
         gp_base = gp_type.split('(')[0].strip().lower()
         
         if gp_base == "timestamp with time zone":
             bc_clean = "regexp_replace({0}, '[+-][0-9]{{2}}(:[0-9]{{2}})? BC$', ' BC')".format(clean_str)
             ts_parse = "CASE WHEN `{0}` LIKE '% BC' THEN to_timestamp({1}, 'yyyy-MM-dd HH:mm:ss G') ELSE to_timestamp({2}, 'yyyy-MM-dd HH:mm:ssX') END".format(col, bc_clean, clean_str)
-            
         elif gp_base in ("timestamp without time zone", "timestamp"):
             ts_parse = "CASE WHEN `{0}` LIKE '% BC' THEN to_timestamp({1}, 'yyyy-MM-dd HH:mm:ss G') ELSE to_timestamp({1}, 'yyyy-MM-dd HH:mm:ss') END".format(col, clean_str)
-            
         elif gp_base == "date":
             ts_parse = "CASE WHEN `{0}` LIKE '% BC' THEN to_timestamp({1}, 'yyyy-MM-dd G') ELSE to_timestamp({1}, 'yyyy-MM-dd') END".format(col, clean_str)
-            
         elif gp_base == "time with time zone":
             clean_str = "concat('1970-01-01 ', {0})".format(clean_str)
             ts_parse = "to_timestamp({0}, 'yyyy-MM-dd HH:mm:ssX')".format(clean_str)
-            
         elif gp_base == "time without time zone":
             clean_str = "concat('1970-01-01 ', {0})".format(clean_str)
             ts_parse = "to_timestamp({0}, 'yyyy-MM-dd HH:mm:ss')".format(clean_str)
         else:
             ts_parse = "to_timestamp({0})".format(clean_str)
 
-        # Step 3: Build Struct for Aggregation (Add 'yr' for safe extreme date sorting)
         if gp_base in ("time with time zone", "time without time zone"):
             struct_expr = "CASE WHEN {0} IS NOT NULL THEN named_struct('ts', {0}, 'val', CAST(`{1}` AS STRING)) END".format(ts_parse, col)
         else:
             year_expr = "CAST(regexp_extract(CAST(`{0}` AS STRING), '^([0-9]+)-', 1) AS BIGINT) * CASE WHEN CAST(`{0}` AS STRING) LIKE '% BC' THEN -1 ELSE 1 END".format(col)
             struct_expr = "CASE WHEN {0} IS NOT NULL THEN named_struct('yr', {2}, 'ts', {0}, 'val', CAST(`{1}` AS STRING)) END".format(ts_parse, col, year_expr)
 
-        # Step 4: Extract Aggregated Value
         return "{0}({1}).val".format(agg_func, struct_expr)
 
     def _build_md5_expr(self, agg_func, col):
-        """ REQ 5.3: MD5 Type without Trim """
-        # Null-safe cast to string, then md5, then agg
         return "CAST({0}(MD5(COALESCE(CAST(`{1}` AS STRING), ''))) AS STRING)".format(agg_func, col)
 
-    def build_agg_exprs(self, cat_cols):
-        """
-        Takes Dictionary of categorized columns and returns Spark DataFrame expressions
-        Example cat_cols: {'SUM_MIN_MAX': ['col1'], 'MIN_MAX': ['col2'], 'MD5_MIN_MAX': ['col3'], 'TYPE_MAP': {'col1':'numeric(18,2)'}}
-        """
+    # // MODIFIED: Added mapping_info parameter to use ext_column_nm for Spark functions
+    def build_agg_exprs(self, cat_cols, mapping_info):
         exprs = [F.expr("CAST(COUNT(*) AS STRING)").alias("count")]
 
-        all_num_cols = set(cat_cols['SUM_MIN_MAX'] + cat_cols['MANUAL_NUM'])
-        all_date_cols = set(cat_cols['MIN_MAX'])
-        all_cpx_cols = set(cat_cols['MD5_MIN_MAX'])
-        # 1. SUM_MIN_MAX
-        for col in all_num_cols:
-            gp_type = cat_cols['TYPE_MAP'].get(col, 'numeric')
-            exprs.append(F.expr(self._build_num_expr('SUM', col, gp_type)).alias("SUM_MIN_MAX|{0}|sum".format(col)))
-            exprs.append(F.expr(self._build_num_expr('MIN', col, gp_type)).alias("SUM_MIN_MAX|{0}|min".format(col)))
-            exprs.append(F.expr(self._build_num_expr('MAX', col, gp_type)).alias("SUM_MIN_MAX|{0}|max".format(col)))
+        all_num_cols = set(cat_cols.get('SUM_MIN_MAX', []) + cat_cols.get('MANUAL_NUM', []))
+        all_date_cols = set(cat_cols.get('MIN_MAX', []))
+        all_cpx_cols = set(cat_cols.get('MD5_MIN_MAX', []))
 
-        # 2. MIN_MAX
-        for col in all_date_cols:
-            gp_type = cat_cols['TYPE_MAP'].get(col, 'timestamp')
-            exprs.append(F.expr(self._build_date_expr('MIN', col, gp_type)).alias("MIN_MAX|{0}|min".format(col)))
-            exprs.append(F.expr(self._build_date_expr('MAX', col, gp_type)).alias("MIN_MAX|{0}|max".format(col)))
+        for gp_col in sorted(all_num_cols):
+            info = mapping_info.get(gp_col, {})
+            ext_col = info.get('ext_name', gp_col) # Use Physical Name for Query
+            gp_type = info.get('data_type', 'numeric')
+            
+            # // Use gp_col for Output Alias Name
+            exprs.append(F.expr(self._build_num_expr('SUM', ext_col, gp_type)).alias("SUM_MIN_MAX|{0}|sum".format(gp_col)))
+            exprs.append(F.expr(self._build_num_expr('MIN', ext_col, gp_type)).alias("SUM_MIN_MAX|{0}|min".format(gp_col)))
+            exprs.append(F.expr(self._build_num_expr('MAX', ext_col, gp_type)).alias("SUM_MIN_MAX|{0}|max".format(gp_col)))
 
-        # 3. MD5_MIN_MAX
-        for col in all_cpx_cols:
-            exprs.append(F.expr(self._build_md5_expr('MIN', col)).alias("MD5_MIN_MAX|{0}|min_md5".format(col)))
-            exprs.append(F.expr(self._build_md5_expr('MAX', col)).alias("MD5_MIN_MAX|{0}|max_md5".format(col)))
+        for gp_col in sorted(all_date_cols):
+            info = mapping_info.get(gp_col, {})
+            ext_col = info.get('ext_name', gp_col)
+            gp_type = info.get('data_type', 'timestamp')
+            
+            exprs.append(F.expr(self._build_date_expr('MIN', ext_col, gp_type)).alias("MIN_MAX|{0}|min".format(gp_col)))
+            exprs.append(F.expr(self._build_date_expr('MAX', ext_col, gp_type)).alias("MIN_MAX|{0}|max".format(gp_col)))
+
+        for gp_col in sorted(all_cpx_cols):
+            info = mapping_info.get(gp_col, {})
+            ext_col = info.get('ext_name', gp_col)
+            
+            exprs.append(F.expr(self._build_md5_expr('MIN', ext_col)).alias("MD5_MIN_MAX|{0}|min_md5".format(gp_col)))
+            exprs.append(F.expr(self._build_md5_expr('MAX', ext_col)).alias("MD5_MIN_MAX|{0}|max_md5".format(gp_col)))
 
         return exprs
 
@@ -635,10 +638,7 @@ class LogParser(object):
                 self.logger.info("[LogParser] Building memory cache for DB: {0}, Schema: {1} ...".format(db, schema))
                 self.cache[cache_key] = {}
                 
-                
-                #search_pattern = os.path.join(self.succeed_base_path, db, "*", "offloadgp_stat_succeeded.{0}.csv".format(schema))
                 search_pattern = os.path.join(self.succeed_base_path, db, "*", "offloadgp_stat.{0}.csv".format(schema))
-                # search_pattern = os.path.join(self.succeed_base_path, db, "backup_old_file", "*", "offloadgp_stat_succeeded.{0}.csv".format(schema))
                 self.logger.info("[LogParser] Searching for succeed log using pattern: {0}".format(search_pattern))
                 matched_files = sorted(glob.glob(search_pattern), reverse=True)
 
@@ -666,7 +666,15 @@ class LogParser(object):
                                         continue
                                     
                                     if gp_tbl:
-                                        gp_tbl_key = gp_tbl.strip().lower()
+                                        # MODIFIED: Clean hidden characters (\r, \n, \xa0) but preserve trailing spaces
+                                        gp_tbl_clean = gp_tbl.replace('\r', '').replace('\n', '').replace('\xa0', ' ').lower()
+                                        
+                                        # ADDED: Normalize cache key to always include schema for accurate matching
+                                        if '.' not in gp_tbl_clean:
+                                            gp_tbl_key = "{0}.{1}".format(schema, gp_tbl_clean).lower()
+                                        else:
+                                            gp_tbl_key = gp_tbl_clean
+
                                         if gp_tbl_key not in self.cache[cache_key]:
                                             self.cache[cache_key][gp_tbl_key] = row
                                         else:
@@ -678,10 +686,47 @@ class LogParser(object):
                             self.logger.warning("[LogParser] Error parsing log file {0}: {1}".format(log_file, e))
                 self.logger.info("[LogParser] Cache build completed. Total {0} tables cached.".format(len(self.cache[cache_key])))
 
-        target_short = partition.strip().lower()
+        # MODIFIED: Clean hidden characters from input partition
+        target_short = partition.replace('\r', '').replace('\n', '').replace('\xa0', ' ').lower()
         target_table_with_schema = "{0}.{1}".format(schema, target_short).lower()
-        latest_row = self.cache[cache_key].get(partition) or self.cache[cache_key].get(target_table_with_schema)
-        # self.logger.info(latest_row)
+        
+        # Step 1: Try Exact Match First
+        latest_row = self.cache[cache_key].get(target_table_with_schema)
+
+        # Step 2: ADDED Fallback Fuzzy Match for trailing spaces issues
+        if not latest_row:
+            self.logger.info("[LogParser] Exact match failed for '{0}'. Attempting fuzzy match...".format(target_table_with_schema))
+            target_base = target_table_with_schema.strip()
+            target_has_space = target_table_with_schema.endswith(' ')
+            
+            possible_matches = {}
+            for cached_tbl, row_data in self.cache[cache_key].items():
+                if cached_tbl.strip() == target_base:
+                    possible_matches[cached_tbl] = row_data
+            
+            if possible_matches:
+                self.logger.info("[LogParser] Found {0} possible matches for base table '{1}'".format(len(possible_matches), target_base))
+                
+                # MODIFIED: Robust disambiguation logic
+                if len(possible_matches) == 1:
+                    cached_tbl = list(possible_matches.keys())[0]
+                    self.logger.info("[LogParser] Fuzzy match SUCCESS: Only 1 variant found in cache: '{0}' (Ignoring strict space check)".format(cached_tbl))
+                    latest_row = possible_matches[cached_tbl]
+                else:
+                    self.logger.info("[LogParser] Multiple variants found. Disambiguating by trailing space... (Target has_space={0})".format(target_has_space))
+                    for cached_tbl, row_data in possible_matches.items():
+                        cached_has_space = cached_tbl.endswith(' ')
+                        if target_has_space == cached_has_space:
+                            self.logger.info("[LogParser] Fuzzy match SUCCESS: Matched trailing space condition with '{0}'".format(cached_tbl))
+                            latest_row = row_data
+                            break
+                    
+                    # Safe fallback if somehow space conditions still fail
+                    if not latest_row:
+                        cached_tbl = list(possible_matches.keys())[0]
+                        self.logger.warning("[LogParser] Could not perfectly match space condition, safely falling back to first variant: '{0}'".format(cached_tbl))
+                        latest_row = possible_matches[cached_tbl]
+
         if latest_row and latest_row.get('Run_Status') == 'SUCCEEDED':
             self.logger.info("[LogParser] Found latest SUCCEEDED record for {0} from Cache. Target Parquet: {1}".format(
                 partition, latest_row.get('File_Path', 'N/A')))
@@ -1036,42 +1081,78 @@ class MetadataFetcher(object):
         self.base_dir = base_dir
         self.logger = logger
 
-    def fetch_data_types(self, db_name, schema_name, table_name):
-        if not self.base_dir or not os.path.exists(self.base_dir): return None, None
-        target_dir = os.path.join(self.base_dir, db_name)
-        if not os.path.exists(target_dir): return None, None
+    def fetch_data_types(self, db, schema, table, fallback_table=None):
+        target_base_dir = self.base_dir
+        db_clean = db.strip().lower()
+        schema_clean = schema.strip().lower()
+        table_clean = table.strip().lower()
         
-        search_pattern = os.path.join(target_dir, '*', schema_name, "*_data_type.txt")
+        search_pattern = os.path.join(target_base_dir, db_clean, "*", schema_clean, "*")
         candidate_files = glob.glob(search_pattern)
         
-        pattern = r"^{0}\.{1}(?:_1_prt_[a-zA-Z0-9_]+)?_\d{{8}}_\d{{6}}_data_type\.txt$".format(
-            re.escape(schema_name), re.escape(table_name)
-        )
+        def get_regex(tbl_name):
+            prefix = "{0}.{1}".format(schema_clean, tbl_name)
+            escaped_prefix = re.escape(prefix).replace(r'\_', '_')
+            pattern_str = r"^{0}_\d{{8}}_\d{{6}}_.*\.txt$".format(escaped_prefix)
+            return re.compile(pattern_str, re.IGNORECASE)
+
+        main_rx = get_regex(table_clean)
+        matches = [f for f in candidate_files if main_rx.match(os.path.basename(f))]
         
-        matches = []
-        for fpath in candidate_files:
-            filename = os.path.basename(fpath)
-            if re.match(pattern, filename):
-                matches.append(fpath)
+        if not matches and fallback_table:
+            fallback_rx = get_regex(fallback_table.strip().lower())
+            matches = [f for f in candidate_files if fallback_rx.match(os.path.basename(f))]
+
+        if not matches: return None, None
+
+        fix_files = [f for f in matches if "fix_ext_colnm" in f.lower()]
+        std_files = [f for f in matches if "data_type.txt" in f.lower()]
         
-        latest_file = sorted(matches)[-1] if matches else None
-  
-        type_map = {}
-        if latest_file:
-            try:
-                with open(latest_file, 'r') as f:
-                    reader = csv.DictReader(f, delimiter='|')
-                    for row in reader:
-                        col_nm = row.get('gp_column_nm', '').strip()
-                        gp_dt = row.get('gp_datatype', '').strip()
-                        
-                        if col_nm and gp_dt:
-                            type_map[col_nm.lower()] = gp_dt
-            except Exception as e:
-                self.logger.warning("Error reading data type file {0}: {1}".format(latest_file, e))
-                return None, None
-                
-        return type_map, latest_file
+        # ลำดับความสำคัญ: fix_ext_colnm > data_type (ไฟล์อื่นเช่น insert_logic หรือ ddl จะถูกทิ้ง)
+        if fix_files:
+            latest_file = sorted(fix_files, reverse=True)[0]
+        elif std_files:
+            latest_file = sorted(std_files, reverse=True)[0]
+        else:
+            if hasattr(self, 'logger'):
+                self.logger.warning("[MetadataFetcher] Found files matching name but NO valid Metadata types (fix_ext_colnm/data_type). File rejected.")
+            return None, None
+
+        type_map = collections.OrderedDict()
+        try:
+            with open(latest_file, 'r') as f:
+                gp_idx, ext_idx, type_idx = 1, 4, 2 # Default indices based on fix_ext_colnm structure
+                for line_no, raw_line in enumerate(f, 1):
+                    try: 
+                        line = raw_line.decode('utf-8').strip()
+                    except UnicodeDecodeError: 
+                        try:
+                            line = raw_line.decode('tis-620', 'ignore').strip()
+                            if hasattr(self, 'logger'): 
+                                self.logger.warning("[MetadataFetcher] [ENCODING FIX] Converted TIS-620/Win-874 byte to Unicode at line {0}. Raw data: {1}".format(line_no, repr(raw_line.strip())))
+                        except Exception as e:
+                            line = raw_line.decode('utf-8', 'ignore').strip()
+                            if hasattr(self, 'logger'): 
+                                self.logger.error("[MetadataFetcher] [ENCODING ERROR] Unrecoverable byte at line {0}. Ignoring bad bytes. Error: {1}".format(line_no, e))
+                    
+                    if not line: continue
+                    if line.lower().startswith(u'gp_tbl_nm|'):
+                        headers = [h.strip().lower() for h in line.split(u'|')]
+                        gp_idx = headers.index(u'gp_column_nm') if u'gp_column_nm' in headers else 1
+                        ext_idx = headers.index(u'ext_column_nm') if u'ext_column_nm' in headers else 4
+                        type_idx = headers.index(u'gp_datatype') if u'gp_datatype' in headers else 2
+                        continue
+                    
+                    parts = line.split(u'|')
+                    if len(parts) > max(gp_idx, ext_idx, type_idx):
+                        gp_name = parts[gp_idx].strip().lower()
+                        ext_name = parts[ext_idx].strip()
+                        data_type = parts[type_idx].strip().lower()
+                        type_map[gp_name] = {'ext_name': ext_name, 'data_type': data_type}
+            return type_map, latest_file
+        except Exception as e:
+            if hasattr(self, 'logger'): self.logger.error("[MetadataFetcher] Error reading {0}: {1}".format(latest_file, e))
+            return None, None
 
 class HiveLogger(object):
     def __init__(self, spark_session, logger):
@@ -1295,28 +1376,14 @@ class Worker(threading.Thread):
                 self.worker_logger.critical("Error writing to CSV: {0}".format(e))
 
     def _check_manual_num(self, master_info, type_map):
-        self.worker_logger.info("DEBUG: master_info = {0}".format(master_info))
-        new_master_info = {'manual_num': []}
         manual_num_err = []
-        
-        for col in master_info.get('manual_num', []):
-            lookup_col = col.strip().lower()
-            datatype = type_map.get(lookup_col)
-            if datatype is None:
-                remark = "Column: {0} is not found in data type file".format(col)
-                self.worker_logger.error("[{0}] {1}".format(self.name, remark))
-                manual_num_err.append(remark)
-                continue
-            
-            base_datatype = datatype.split('(')[0].strip().lower()
-            if base_datatype in ['bigint', 'integer', 'int']:
-                new_master_info['manual_num'].append(col)
+        new_master_info = {'manual_num': []}
+        type_map_lower = {k.lower(): k for k in type_map.keys()}
+        for col_lower in master_info['manual_num']:
+            if col_lower in type_map_lower:
+                new_master_info['manual_num'].append(type_map_lower[col_lower])
             else:
-                remark = "Column: {0} is NOT bigint or integer (data type = {1})".format(col, datatype)
-                self.worker_logger.error("[{0}] {1}".format(self.name, remark))
-                manual_num_err.append(remark)
-
-        self.worker_logger.info("DEBUG: new_master_info = {0}".format(new_master_info))
+                manual_num_err.append(col_lower)
         return new_master_info, manual_num_err
 
     def _summarize_columns_for_log(self, columns, type_map=None, max_items=40):
@@ -1499,294 +1566,287 @@ class Worker(threading.Thread):
             return False
 
     def run(self):
-        while(True):
-            if self.abort_event.is_set():
-                break
-
-            try:
-                task = self.queue.get(block=True, timeout=2)
-            except Queue.Empty:
-                self.tracker.update_worker_status(self.base_name, "[IDLE] Finished")
-                break
-
-            db = task['db']
-            schema = task['schema']
-            partition = task['partition']
-            # Update name to include current table for clearer log line prefixes
-            self.name = "{0}-{1}".format(self.base_name, partition)
-            start_datetime = datetime.now()
-            start_t = time.time()
-
-            table = task['partition'].strip().lower()
-            full_name = "{0}.{1}.{2}".format(db, schema, table)
-
-            # pre-defined logging info
-            self.db = db
-            self.schema = schema
-            self.short_name = "{0}.{1}".format(self.schema, table)
-            self.start_time_tbl = start_t
-            self.start_ts_tbl = datetime.fromtimestamp(start_t).strftime("%Y-%m-%d %H:%M:%S")
-            #self.status = "PROCESSING"
-            self.reconcile_method = ['count']
-
-            status = "FAILED"
-            remark = ""
-            nas_json_path = ""
-            hdfs_dest = ""
-
-            base_table = partition.split('_1_prt_')[0] if '_1_prt_' in partition else partition
-
-            try:
-                self.tracker.update_worker_status(self.base_name, "[BUSY] {0}".format(partition))
-
-                # Step 1: Check Succeed Log
-                log_row, log_msg = self.log_parser.get_latest_succeed_info(db, schema, partition)
-                if not log_row:
-                    raise ValueError(log_msg)
-
-                # Only new offloadgp_stat schema exists — read count from canonical field
-                source_count = parse_source_count(
-                    log_row.get('Greenplum_Num_Record', ''),
-                    self.worker_logger,
-                    "[{0}]".format(self.name)
-                )
-                source_is_zero = (source_count == 0)
-
-                # Step 2: Verify HDFS sync record exists and is SUCCEEDED, then confirm .parquet files present
-                if not source_is_zero:
-                    hdfs_from_stat, sync_status = self._read_hdfs_sync_status(db, schema, partition)
-                    if not sync_status:
-                        raise ValueError("SKIPPED: No HDFS sync record found for {0}".format(partition))
-                    if sync_status != "SUCCEEDED":
-                        raise ValueError("FAILED: Latest status of HDFS Sync is not SUCCEEDED.")
-                    hdfs_dest = hdfs_from_stat
-                    # True = at least one .parquet file was found anywhere under the HDFS path
-                    parquet_files_exist = self._hdfs_has_parquet(hdfs_dest)
-                    if parquet_files_exist == False:
-                        raise ValueError("FAILED: No .parquet files at HDFS path: {0}".format(hdfs_dest))
-                    self.worker_logger.info("[{0}] HDFS pre-check passed: {1}".format(self.name, hdfs_dest))
-                else:
-                    hdfs_dest = "-"
-                    self.worker_logger.info("[{0}] Source_Count=0. Skip HDFS parquet checks and build null-structured JSON.".format(self.name))
-
-                # Step 3: Fetch Metadata & Categorize
-                type_map, meta_file_path = self.meta_fetcher.fetch_data_types(db, schema, base_table)
-                self.worker_logger.info("[{0}] Metadata file used: {1}".format(self.name, meta_file_path))
-                self.worker_logger.info("[{0}] Mapping logic used: {1}".format(self.name, self.config.mapping_file_path))
-                missing_meta = True if type_map is None else False
-                type_map = type_map or {}
-
-                master_info = self.config.master_data.get((db, schema, base_table), {'manual_num': []})
-                
-                ### Check if user's manual input column exists in table ###
-                manual_num_err = []
-                new_master_info = {'manual_num': []}
-                if not missing_meta: 
-                    new_master_info, manual_num_err = self._check_manual_num(master_info, type_map)
-                
-                cat_cols = {'SUM_MIN_MAX': [], 'MIN_MAX': [], 'MD5_MIN_MAX': [], 'TYPE_MAP': type_map, 
-                            'MANUAL_NUM': new_master_info['manual_num']}
-                ### ======================================================================= ###
-                thai_config = self.config.thai_dict.get((db.lower(), partition.lower()), {})
-                if not thai_config:
-                    thai_config = self.config.thai_dict.get((db.lower(), base_table.lower()), {})                
-                
-                if not missing_meta:
-                    for col, gp_dt in type_map.items():
-                        gp_base = gp_dt.split('(')[0].strip().lower()
-                        thai_flag = thai_config.get(col)
-                        if thai_flag == 'Y':
-                            gp_base = 'thai_col_flag_y'
-                        elif thai_flag == 'N':
-                            gp_base = 'thai_col_flag_n'
-
-                        if gp_base in self.config.type_mapping.get("SUM_MIN_MAX", []):
-                            cat_cols['SUM_MIN_MAX'].append(col)
-                            self.reconcile_method.append('number_sum_min_max')
-                        elif gp_base in self.config.type_mapping.get("MIN_MAX", []):
-                            cat_cols['MIN_MAX'].append(col)
-                            self.reconcile_method.append('dttm_min_max')
-                        elif gp_base in self.config.type_mapping.get("MD5_MIN_MAX", []):
-                            cat_cols['MD5_MIN_MAX'].append(col)
-                            self.reconcile_method.append('md5_min_max')
-                        elif gp_base in self.config.list_datatype_conv_only_no_len and '(' not in gp_dt:
-                            cat_cols['MD5_MIN_MAX'].append(col)
-                            self.reconcile_method.append('md5_min_max')
-
-                agg_exprs = self.query_builder.build_agg_exprs(cat_cols)
-
-                # Step 4: Build Result JSON
-                final_json = collections.OrderedDict()
-                final_json["table"] = "{0}.{1}.{2}".format(db, schema, partition)
-                final_json["source_type"] = "parquet"
-                final_json["methods"] = collections.OrderedDict()
-
-                if source_is_zero:
-                    final_json["count"] = 0
-
-                    sum_cols = sorted(set(cat_cols.get('SUM_MIN_MAX', []) + cat_cols.get('MANUAL_NUM', [])))
-                    min_max_cols = sorted(set(cat_cols.get('MIN_MAX', [])))
-                    md5_cols = sorted(set(cat_cols.get('MD5_MIN_MAX', [])))
-
-                    if sum_cols:
-                        final_json["methods"]["SUM_MIN_MAX"] = collections.OrderedDict()
-                        for col in sum_cols:
-                            final_json["methods"]["SUM_MIN_MAX"][col] = collections.OrderedDict()
-                            final_json["methods"]["SUM_MIN_MAX"][col]["data_type"] = type_map.get(col, "unknown")
-                            final_json["methods"]["SUM_MIN_MAX"][col]["sum"] = None
-                            final_json["methods"]["SUM_MIN_MAX"][col]["min"] = None
-                            final_json["methods"]["SUM_MIN_MAX"][col]["max"] = None
-
-                    if min_max_cols:
-                        final_json["methods"]["MIN_MAX"] = collections.OrderedDict()
-                        for col in min_max_cols:
-                            final_json["methods"]["MIN_MAX"][col] = collections.OrderedDict()
-                            final_json["methods"]["MIN_MAX"][col]["data_type"] = type_map.get(col, "unknown")
-                            final_json["methods"]["MIN_MAX"][col]["min"] = None
-                            final_json["methods"]["MIN_MAX"][col]["max"] = None
-
-                    if md5_cols:
-                        final_json["methods"]["MD5_MIN_MAX"] = collections.OrderedDict()
-                        for col in md5_cols:
-                            final_json["methods"]["MD5_MIN_MAX"][col] = collections.OrderedDict()
-                            final_json["methods"]["MD5_MIN_MAX"][col]["data_type"] = type_map.get(col, "unknown")
-                            final_json["methods"]["MD5_MIN_MAX"][col]["min_md5"] = None
-                            final_json["methods"]["MD5_MIN_MAX"][col]["max_md5"] = None
-                else:
-                    self.spark.sparkContext.setJobGroup(partition, "Query: " + partition)
-                    parquet_read_path = self._resolve_parquet_path(hdfs_dest)
-                    df = self.spark.read.parquet(parquet_read_path)
-                    self._log_reconcile_column_usage(partition, cat_cols, df.dtypes)
-
-                    self.worker_logger.info("Worker {0} executing Spark Action for {1}...".format(self.name, partition))
-
-                    agg_result = df.agg(*agg_exprs).collect()
-                    if not agg_result:
-                        raise RuntimeError("Spark aggregation returned empty result for {0}".format(partition))
-
-                    sp_row = agg_result[0]
-                    sp_res = sp_row.asDict()
-                    self.spark.sparkContext.setLocalProperty("spark.jobGroup.id", None)
-
-                    def format_val(v):
-                        if v is None: return None
-                        v_str = str(v)
-                        if 'E' in v_str or 'e' in v_str:
-                            try:
-                                return "{:f}".format(Decimal(v_str))
-                            except Exception:
-                                pass
-                        return v
-
-                    final_json["count"] = int(sp_res.pop("count", 0))
-
-                    parsed_res = {}
-                    for k, v in sp_res.items():
-                        parts = k.split('|')
-                        if len(parts) == 3:
-                            method, col, func = parts
-                            if method not in parsed_res: parsed_res[method] = {}
-                            if col not in parsed_res[method]: parsed_res[method][col] = {}
-                            parsed_res[method][col][func] = format_val(v)
-
-                    for method in ["SUM_MIN_MAX", "MIN_MAX", "MD5_MIN_MAX"]:
-                        if method in parsed_res:
-                            final_json["methods"][method] = collections.OrderedDict()
-                            for col in sorted(parsed_res[method].keys()):
-                                final_json["methods"][method][col] = collections.OrderedDict()
-                                final_json["methods"][method][col]["data_type"] = type_map.get(col, "unknown")
-                                for f in ["sum", "min", "max", "min_md5", "max_md5"]:
-                                    if f in parsed_res[method][col]:
-                                        final_json["methods"][method][col][f] = parsed_res[method][col][f]
-
-                # Step 5: Write to NAS
-                query_file_name = "query_{0}_{1}_{2}_{3}.sql".format(db, schema, partition, self.global_ts)
-                local_query_file = os.path.join(self.out_path, query_file_name)
-                
-                try:
-                    with open(local_query_file, 'w') as f:
-                        f.write("-- PySpark Aggregation Expressions for {0}\n".format(partition))
-                        for expr in agg_exprs:
-                            f.write(str(expr) + "\n")
-                except IOError as e:
-                    raise IOError("Failed to save local SQL file {0}: {1}".format(local_query_file, e))
-
-                out_file_name = "parquet_{0}_{1}_{2}_{3}.json".format(db, schema, partition, self.global_ts)
-                self.local_json_file = os.path.join(self.out_path, out_file_name)
-                
-                try:
-                    with open(self.local_json_file, 'w') as f:
-                        json.dump(final_json, f)
-                except IOError as e:
-                    raise IOError("Failed to save local JSON output {0}: {1}".format(self.local_json_file, e))
-
-                # Copy both files to NAS
-                copy_success, copy_err = self._copy_file_to_nas(self.local_json_file, db, schema, out_file_name)
-               
-                # Check actual existence on NAS
-                nas_dir = os.path.join(self.config.nas_destination, db, schema)
-                nas_json_path = os.path.join(nas_dir, out_file_name)
-                
-                json_exists = os.path.exists(nas_json_path)
-                if copy_success and json_exists:
-                    self.worker_logger.info("Worker {0} successfully saved and copied JSON to NAS for {1}".format(self.name, partition))
-                    status = "SUCCESS"
-                    if source_is_zero:
-                        remark = "JSON Generated (Source_Count=0; null-structured result)."
-                    else:
-                        remark = "JSON Generated."
-                else:
-                    self.worker_logger.error("Worker {0} failed NAS sync for {1}. JSON Err: {2}".format(
-                        self.name, partition, copy_err))
-                    
-                    status = "FAILED"
-                    err_remarks = []
-                    if not copy_success: err_remarks.append("JSON Copy Error ({0})".format(copy_err))
-                    if not json_exists: err_remarks.append("JSON Not Found on NAS")
-                    # if not copy_sql_success: err_remarks.append("SQL Copy Error ({0})".format(copy_sql_err))
-                    # if not sql_exists: err_remarks.append("SQL Not Found on NAS")
-                    remark = " | ".join(err_remarks)
-
-                # Step 6: Finalize Status
-                duration = time.time() - start_t
-
-                if missing_meta:
-                    remark = "Metadata Missing (Count-only) | " + remark
-
-                if manual_num_err:
-                    status = "FAILED"
-                    remark = "{0} | {1}".format(remark, ",".join(manual_num_err))
-                
-                self.tracker.add_result(partition, status, duration, remark)
-
-            except ValueError as ve:
-                remark = str(ve)
-                if "SKIPPED" in remark:
-                    status = "SKIPPED"
-                    remark = remark.replace("SKIPPED: ", "").replace("SKIPPED", "").strip()
-                else:
-                    status = "FAILED"
-                self.tracker.add_result(partition, status, time.time() - start_t, remark)
-            except Exception as e:
-                remark = str(e)
-                status = "FAILED"
-                self.worker_logger.warning("Worker {0} failed on {1}: {2}".format(self.name, partition, e))
-                self.logger.warning("Worker {0} failed on {1}: {2}".format(self.name, partition, e))
-                self.tracker.add_result(partition, "FAILED", time.time() - start_t, "Error: {0}".format(remark[:50]))
-                self.hive_logger.log_execution_status(self.execution_id, db, schema, base_table, partition, start_datetime, datetime.now(), time.time() - start_t, "failed", remark[:200])
-                if "CRITICAL_FAILED:" in remark:
-                    self.logger.critical("Worker {0} signaling global abort due to CRITICAL_FAILED condition.".format(self.name))
-                    self.abort_event.set()
+            while(True):
+                if self.abort_event.is_set():
                     break
-            finally:
-                # After finishing processing, write one CSV line:
+                
                 try:
-                    self.worker_logger.info("Worker {0} logging status for {1}...".format(self.name, full_name))
-                    self.logging_status(status, remark, nas_json_path, hdfs_dest)
-                except Exception as e:
-                    self.worker_logger.error("Failed writing logging_status for {}: {}".format(full_name, e))
-                self.queue.task_done()
+                    task = self.queue.get(block=True, timeout=2)
+                except Queue.Empty:
+                    self.tracker.update_worker_status(self.base_name, "[IDLE] Finished")
+                    break
+                
+                db = task['db']
+                schema = task['schema']
+                partition = task['partition']
+                self.name = "{0}-{1}".format(self.base_name, partition)
+                start_datetime = datetime.now()
+                start_t = time.time()
 
+                table = task['partition'].lower()
+                full_name = "{0}.{1}.{2}".format(db, schema, table)
+
+                self.db = db
+                self.schema = schema
+                self.short_name = "{0}.{1}".format(self.schema, table)
+                self.start_time_tbl = start_t
+                self.start_ts_tbl = datetime.fromtimestamp(start_t).strftime("%Y-%m-%d %H:%M:%S")
+                self.reconcile_method = ['count']
+
+                status = "FAILED"
+                remark = ""
+                nas_json_path = ""
+                hdfs_dest = ""
+
+                base_table = partition.split('_1_prt_')[0] if '_1_prt_' in partition else partition
+
+                try:
+                    self.tracker.update_worker_status(self.base_name, "[BUSY] {0}".format(partition))
+
+                    log_row, log_msg = self.log_parser.get_latest_succeed_info(db, schema, partition)
+                    if not log_row:
+                        raise ValueError(log_msg)
+
+                    source_count = parse_source_count(
+                        log_row.get('Greenplum_Num_Record', ''),
+                        self.worker_logger,
+                        "[{0}]".format(self.name)
+                    )
+                    source_is_zero = (source_count == 0)
+
+                    if not source_is_zero:
+                        hdfs_from_stat, sync_status = self._read_hdfs_sync_status(db, schema, partition)
+                        if not sync_status:
+                            raise ValueError("SKIPPED: No HDFS sync record found for {0}".format(partition))
+                        if sync_status != "SUCCEEDED":
+                            raise ValueError("FAILED: Latest status of HDFS Sync is not SUCCEEDED.")
+                        hdfs_dest = hdfs_from_stat
+                        parquet_files_exist = self._hdfs_has_parquet(hdfs_dest)
+                        if parquet_files_exist == False:
+                            raise ValueError("FAILED: No .parquet files at HDFS path: {0}".format(hdfs_dest))
+                        self.worker_logger.info("[{0}] HDFS pre-check passed: {1}".format(self.name, hdfs_dest))
+                    else:
+                        hdfs_dest = "-"
+                        self.worker_logger.info("[{0}] Source_Count=0. Skip HDFS parquet checks and build null-structured JSON.".format(self.name))
+
+                    type_map, meta_file_path = self.meta_fetcher.fetch_data_types(db, schema, partition, fallback_table=base_table)
+                    if meta_file_path:
+                        meta_filename = os.path.basename(meta_file_path)
+                        self.logger.info("[{0}] >>> Table: {1} | Metadata File: {2}".format(self.name, partition, meta_filename))
+                    else:
+                        self.logger.warning("[{0}] >>> Table: {1} | Metadata File: NOT FOUND".format(self.name, partition))
+                    self.worker_logger.info("[{0}] Metadata file used: {1}".format(self.name, meta_file_path))
+                    missing_meta = True if type_map is None else False
+
+                    # // ADDED: Clean type map for logic that requires simple dict structure
+                    clean_type_map = {}
+                    if not missing_meta:
+                        for gp_k, info in type_map.items():
+                            clean_type_map[gp_k] = info['data_type']
+
+                    master_info = self.config.master_data.get((db, schema, base_table), {'manual_num': []})
+
+                    manual_num_err = []
+                    new_master_info = {'manual_num': []}
+                    if not missing_meta: 
+                        new_master_info, manual_num_err = self._check_manual_num(master_info, clean_type_map)
+
+                    cat_cols = {'SUM_MIN_MAX': [], 'MIN_MAX': [], 'MD5_MIN_MAX': [], 'TYPE_MAP': clean_type_map, 
+                                'MANUAL_NUM': new_master_info['manual_num']}
+
+                    thai_config = self.config.thai_dict.get((db.lower(), schema.lower(), partition.lower()), {})
+                    if not thai_config:
+                        thai_config = self.config.thai_dict.get((db.lower(), schema.lower(), base_table.lower()), {})                
+
+                    if not missing_meta:
+                        for col, info in type_map.items():
+                            gp_dt = info['data_type']
+                            gp_base = gp_dt.split('(')[0].strip().lower()
+                            thai_flag = thai_config.get(col.lower())
+                            if thai_flag == 'Y':
+                                gp_base = 'thai_col_flag_y'
+                            elif thai_flag == 'N':
+                                gp_base = 'thai_col_flag_n'
+
+                            if gp_base in self.config.type_mapping.get("SUM_MIN_MAX", []):
+                                cat_cols['SUM_MIN_MAX'].append(col)
+                                self.reconcile_method.append('number_sum_min_max')
+                            elif gp_base in self.config.type_mapping.get("MIN_MAX", []):
+                                cat_cols['MIN_MAX'].append(col)
+                                self.reconcile_method.append('dttm_min_max')
+                            elif gp_base in self.config.type_mapping.get("MD5_MIN_MAX", []):
+                                cat_cols['MD5_MIN_MAX'].append(col)
+                                self.reconcile_method.append('md5_min_max')
+                            elif gp_base in self.config.list_datatype_conv_only_no_len and '(' not in gp_dt:
+                                cat_cols['MD5_MIN_MAX'].append(col)
+                                self.reconcile_method.append('md5_min_max')
+
+                    # // MODIFIED: Pass type_map (containing ext_name) to build mapping-aware aggregate expressions
+                    agg_exprs = self.query_builder.build_agg_exprs(cat_cols, type_map or {})
+
+                    final_json = collections.OrderedDict()
+                    final_json["table"] = "{0}.{1}.{2}".format(db, schema, partition)
+                    final_json["source_type"] = "parquet"
+                    final_json["methods"] = collections.OrderedDict()
+
+                    if source_is_zero:
+                        final_json["count"] = 0
+                        sum_cols = sorted(set(cat_cols.get('SUM_MIN_MAX', []) + cat_cols.get('MANUAL_NUM', [])))
+                        min_max_cols = sorted(set(cat_cols.get('MIN_MAX', [])))
+                        md5_cols = sorted(set(cat_cols.get('MD5_MIN_MAX', [])))
+
+                        if sum_cols:
+                            final_json["methods"]["SUM_MIN_MAX"] = collections.OrderedDict()
+                            for col in sum_cols:
+                                final_json["methods"]["SUM_MIN_MAX"][col] = collections.OrderedDict()
+                                final_json["methods"]["SUM_MIN_MAX"][col]["data_type"] = clean_type_map.get(col, "unknown")
+                                final_json["methods"]["SUM_MIN_MAX"][col]["sum"] = None
+                                final_json["methods"]["SUM_MIN_MAX"][col]["min"] = None
+                                final_json["methods"]["SUM_MIN_MAX"][col]["max"] = None
+
+                        if min_max_cols:
+                            final_json["methods"]["MIN_MAX"] = collections.OrderedDict()
+                            for col in min_max_cols:
+                                final_json["methods"]["MIN_MAX"][col] = collections.OrderedDict()
+                                final_json["methods"]["MIN_MAX"][col]["data_type"] = clean_type_map.get(col, "unknown")
+                                final_json["methods"]["MIN_MAX"][col]["min"] = None
+                                final_json["methods"]["MIN_MAX"][col]["max"] = None
+
+                        if md5_cols:
+                            final_json["methods"]["MD5_MIN_MAX"] = collections.OrderedDict()
+                            for col in md5_cols:
+                                final_json["methods"]["MD5_MIN_MAX"][col] = collections.OrderedDict()
+                                final_json["methods"]["MD5_MIN_MAX"][col]["data_type"] = clean_type_map.get(col, "unknown")
+                                final_json["methods"]["MD5_MIN_MAX"][col]["min_md5"] = None
+                                final_json["methods"]["MD5_MIN_MAX"][col]["max_md5"] = None
+                    else:
+                        self.spark.sparkContext.setJobGroup(partition, "Query: " + partition)
+                        parquet_read_path = self._resolve_parquet_path(hdfs_dest)
+                        df = self.spark.read.parquet(parquet_read_path)
+
+                        # // REMOVED: Rename block is removed to use ext_column_nm directly in Query Builder
+
+                        self._log_reconcile_column_usage(partition, cat_cols, df.dtypes)
+                        self.worker_logger.info("Worker {0} executing Spark Action for {1}...".format(self.name, partition))
+
+                        agg_result = df.agg(*agg_exprs).collect()
+                        if not agg_result:
+                            raise RuntimeError("Spark aggregation returned empty result for {0}".format(partition))
+
+                        sp_row = agg_result[0]
+                        sp_res = sp_row.asDict()
+                        self.spark.sparkContext.setLocalProperty("spark.jobGroup.id", None)
+
+                        def format_val(v):
+                            if v is None: return None
+                            v_str = str(v)
+                            if 'E' in v_str or 'e' in v_str:
+                                try:
+                                    return "{:f}".format(Decimal(v_str))
+                                except Exception:
+                                    pass
+                            return v
+
+                        final_json["count"] = int(sp_res.pop("count", 0))
+
+                        parsed_res = {}
+                        for k, v in sp_res.items():
+                            parts = k.split('|')
+                            if len(parts) == 3:
+                                method, col, func = parts
+                                if method not in parsed_res: parsed_res[method] = {}
+                                if col not in parsed_res[method]: parsed_res[method][col] = {}
+                                parsed_res[method][col][func] = format_val(v)
+
+                        for method in ["SUM_MIN_MAX", "MIN_MAX", "MD5_MIN_MAX"]:
+                            if method in parsed_res:
+                                final_json["methods"][method] = collections.OrderedDict()
+                                for col in sorted(parsed_res[method].keys()):
+                                    final_json["methods"][method][col] = collections.OrderedDict()
+                                    final_json["methods"][method][col]["data_type"] = clean_type_map.get(col, "unknown")
+                                    for f in ["sum", "min", "max", "min_md5", "max_md5"]:
+                                        if f in parsed_res[method][col]:
+                                            final_json["methods"][method][col][f] = parsed_res[method][col][f]
+
+                    # // RESTORED: Query SQL write block
+                    query_file_name = "query_{0}_{1}_{2}_{3}.sql".format(db, schema, partition, self.global_ts)
+                    local_query_file = os.path.join(self.out_path, query_file_name)
+
+                    try:
+                        with open(local_query_file, 'w') as f:
+                            f.write("-- PySpark Aggregation Expressions for {0}\n".format(partition))
+                            for expr in agg_exprs:
+                                f.write(str(expr) + "\n")
+                    except IOError as e:
+                        raise IOError("Failed to save local SQL file {0}: {1}".format(local_query_file, e))
+
+                    out_file_name = "parquet_{0}_{1}_{2}_{3}.json".format(db, schema, partition, self.global_ts)
+                    self.local_json_file = os.path.join(self.out_path, out_file_name)
+
+                    try:
+                        with open(self.local_json_file, 'w') as f:
+                            json.dump(final_json, f)
+                    except IOError as e:
+                        raise IOError("Failed to save local JSON output {0}: {1}".format(self.local_json_file, e))
+
+                    copy_success, copy_err = self._copy_file_to_nas(self.local_json_file, db, schema, out_file_name)
+
+                    nas_dir = os.path.join(self.config.nas_destination, db, schema)
+                    nas_json_path = os.path.join(nas_dir, out_file_name)
+
+                    json_exists = os.path.exists(nas_json_path)
+                    if copy_success and json_exists:
+                        self.worker_logger.info("Worker {0} successfully saved and copied JSON to NAS for {1}".format(self.name, partition))
+                        status = "SUCCESS"
+                        if source_is_zero:
+                            remark = "JSON Generated (Source_Count=0; null-structured result)."
+                        else:
+                            remark = "JSON Generated."
+                    else:
+                        self.worker_logger.error("Worker {0} failed NAS sync for {1}. JSON Err: {2}".format(
+                            self.name, partition, copy_err))
+
+                        status = "FAILED"
+                        err_remarks = []
+                        if not copy_success: err_remarks.append("JSON Copy Error ({0})".format(copy_err))
+                        if not json_exists: err_remarks.append("JSON Not Found on NAS")
+                        remark = " | ".join(err_remarks)
+
+                    duration = time.time() - start_t
+                    if missing_meta:
+                        remark = "Metadata Missing (Count-only) | " + remark
+                    if manual_num_err:
+                        status = "FAILED"
+                        remark = "{0} | {1}".format(remark, ",".join(manual_num_err))
+
+                    self.tracker.add_result(partition, status, duration, remark)
+
+                except ValueError as ve:
+                    remark = str(ve)
+                    if "SKIPPED" in remark:
+                        status = "SKIPPED"
+                        remark = remark.replace("SKIPPED: ", "").replace("SKIPPED", "").strip()
+                    else:
+                        status = "FAILED"
+                    self.tracker.add_result(partition, status, time.time() - start_t, remark)
+                except Exception as e:
+                    remark = str(e)
+                    status = "FAILED"
+                    self.worker_logger.warning("Worker {0} failed on {1}: {2}".format(self.name, partition, e))
+                    self.logger.warning("Worker {0} failed on {1}: {2}".format(self.name, partition, e))
+                    self.tracker.add_result(partition, "FAILED", time.time() - start_t, "Error: {0}".format(remark[:50]))
+                    self.hive_logger.log_execution_status(self.execution_id, db, schema, base_table, partition, start_datetime, datetime.now(), time.time() - start_t, "failed", remark[:200])
+                    if "CRITICAL_FAILED:" in remark:
+                        self.logger.critical("Worker {0} signaling global abort due to CRITICAL_FAILED condition.".format(self.name))
+                        self.abort_event.set()
+                        break
+                finally:
+                    try:
+                        self.worker_logger.info("Worker {0} logging status for {1}...".format(self.name, full_name))
+                        self.logging_status(status, remark, nas_json_path, hdfs_dest)
+                    except Exception as e:
+                        self.worker_logger.error("Failed writing logging_status for {}: {}".format(full_name, e))
+                    self.queue.task_done()
 
 class UploadWorker(threading.Thread):
     """
